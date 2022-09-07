@@ -24,7 +24,9 @@ using (var reader = new StreamReader(file, true))
     tempFiles = reader
         .EnumerateLines()
         .Chunk(chunkSize)
+#if !DEBUG
         .AsParallel()
+#endif
         .Select(chunk => {
             Array.Sort(chunk, comparer);
             var tempFileName = Path.GetTempFileName();
