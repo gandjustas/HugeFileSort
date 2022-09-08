@@ -1,6 +1,4 @@
 ﻿
-using System.Text;
-
 const string TextCharacters = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
 const int DefaultCount = 10_000_000;
 const int MinStringLength = 16;
