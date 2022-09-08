@@ -1,8 +1,11 @@
 ﻿
+using System.Text;
+
 const string TextCharacters = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
 const int DefaultCount = 10_000_000;
 const int MinStringLength = 16;
 const int MaxStringLength = 256;
+const int FileBufferSize = 4 * 1024 * 1024; //4 MB
 
 if ((args?.Length ?? 0) == 0)
 {
@@ -15,8 +18,17 @@ var count = args.Length > 1 ? int.Parse(args[1]) : DefaultCount;
 var maxStringLength = args.Length > 2 ? int.Parse(args[2]) : MaxStringLength;
 var minStringLength = args.Length > 3 ? int.Parse(args[3]) : MinStringLength;
 
-using (var f = File.CreateText(file))
-    Generate(f, count, minStringLength, maxStringLength);
+FileStreamOptions fileWriteOptions = new()
+{
+    Mode = FileMode.Create,
+    Access = FileAccess.Write,
+    BufferSize = FileBufferSize
+};
+using (StreamWriter writer = new(file, fileWriteOptions))
+{
+    writer.AutoFlush = false;
+    Generate(writer, count, minStringLength, maxStringLength);
+}
 return 0;
 
 

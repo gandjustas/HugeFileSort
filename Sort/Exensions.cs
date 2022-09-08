@@ -16,7 +16,7 @@ namespace Sort
             }
         }
 
-        public static IEnumerable<string> MergeLines(this IEnumerable<IEnumerable<string>> sources, IComparer<string> comparer)
+        public static IEnumerable<T> MergeLines<T>(this IEnumerable<IEnumerable<T>> sources, Comparison<T> comparer)
         {
             var heap = (from source in sources
                         let e = source.GetEnumerator()
@@ -39,7 +39,7 @@ namespace Sort
             }
         }
 
-        private static void Heapify<T, V>(T[] heap, Func<T, V> selector, int index, IComparer<V> comparer)
+        private static void Heapify<T, V>(T[] heap, Func<T, V> selector, int index, Comparison<V> comparer)
         {
             var min = index;
             while (true)
@@ -48,12 +48,12 @@ namespace Sort
                 var rightChild = 2 * index + 2;
                 var v = selector(heap[index]);
 
-                if (rightChild < heap.Length && comparer.Compare(v, selector(heap[rightChild])) > 0)
+                if (rightChild < heap.Length && comparer(v, selector(heap[rightChild])) > 0)
                 {
                     min = rightChild;
                 }
 
-                if (leftChild < heap.Length && comparer.Compare(v, selector(heap[leftChild])) > 0)
+                if (leftChild < heap.Length && comparer(v, selector(heap[leftChild])) > 0)
                 {
                     min = leftChild;
                 }
@@ -68,7 +68,7 @@ namespace Sort
             }
         }
 
-        private static void BuildHeap<T, V>(T[] heap, Func<T, V> selector, IComparer<V> comparer)
+        private static void BuildHeap<T, V>(T[] heap, Func<T, V> selector, Comparison<V> comparer)
         {
             for (int i = heap.Length / 2; i >= 0; i--)
             {
