@@ -11,6 +11,11 @@ if ((args?.Length ?? 0) == 0)
 }
 
 var file = args![0];
+var dir = Path.GetDirectoryName(file);
+var fileName = Path.GetFileNameWithoutExtension(file);
+var fileExt = Path.GetExtension(file);
+var unique = new Random().Next().ToString("X8");
+
 var chunkSize = args?.Length > 1 ? int.Parse(args[1]) : DefaultChunkSize;
 
 var comparer = new Comparer(StringComparison.CurrentCulture);
@@ -27,9 +32,9 @@ using (var reader = new StreamReader(file, true))
 #if !DEBUG
         .AsParallel()
 #endif
-        .Select(chunk => {
+        .Select((chunk, n) => {            
             Array.Sort(chunk, comparer);
-            var tempFileName = Path.GetTempFileName();
+            var tempFileName = Path.Combine(dir, $"{fileName}-{unique}-{n}{fileExt}");
             File.WriteAllLines(tempFileName, chunk);
             return tempFileName;
         }).ToList();
