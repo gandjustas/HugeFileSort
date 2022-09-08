@@ -1,5 +1,4 @@
 ﻿using Sort;
-using System.Diagnostics;
 using System.Text;
 
 const int DefaultChunkSize = 100_000;
@@ -19,10 +18,14 @@ var unique = new Random().Next().ToString("X8");
 var chunkSize = args?.Length > 1 ? int.Parse(args[1]) : DefaultChunkSize;
 
 var comparer = new Comparer(StringComparison.CurrentCulture);
+FileStreamOptions fileOptions = new() { 
+    Options = FileOptions.SequentialScan,
+    BufferSize = 4 * 1024 * 1024
+};
 
 Encoding encoding;
 List<string> tempFiles;
-using (var reader = new StreamReader(file, true))
+using (var reader = new StreamReader(file, Encoding.UTF8, true, fileOptions))
 {
     encoding = reader.CurrentEncoding;
 
@@ -38,13 +41,13 @@ using (var reader = new StreamReader(file, true))
             File.WriteAllLines(tempFileName, chunk);
             return tempFileName;
         }).ToList();
-
+    
 }
 
 try
 {
         var files = tempFiles
-            .Select(f => File.OpenText(f))
+            .Select(f => new StreamReader(f, Encoding.UTF8, false, fileOptions))
             .ToList();
         File.WriteAllLines(file, files.Select(f => f.EnumerateLines()).MergeLines(comparer), encoding);
         files.ForEach(f => f.Dispose());
