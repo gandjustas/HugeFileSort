@@ -31,7 +31,7 @@ namespace Sort
                 if (!min.MoveNext())
                 {
                     min.Dispose();
-                    if (heap.Length == 1) break;
+                    if (heap.Length == 1) yield break;
                     heap[0] = heap[^1];
                     Array.Resize(ref heap, heap.Length-1);
                 }
