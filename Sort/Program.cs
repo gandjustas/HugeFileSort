@@ -1,9 +1,9 @@
 ﻿using Sort;
 using System.Buffers;
-using System.ComponentModel.DataAnnotations;
 using System.Text;
 
-long DefaultChunkSize = GC.GetGCMemoryInfo().TotalAvailableMemoryBytes / (5 * 4 * 1024); //20% of memory, 4kb string ;
+//long DefaultChunkSize = GC.GetGCMemoryInfo().TotalAvailableMemoryBytes / (5 * 4 * 1024); //20% of memory, 4kb string ;
+long DefaultChunkSize = 100_000;
 const int FileBufferSize = 4 * 1024 * 1024; //4 MB
 
 if ((args?.Length ?? 0) == 0)
@@ -43,21 +43,23 @@ List<string> tempFiles;
 using (var reader = new StreamReader(file, Encoding.UTF8, true, fileReadOptions))
 {
     encoding = reader.CurrentEncoding;
-
     tempFiles = reader
         .EnumerateLines()
         .Select(l => (l, l.IndexOf('.')))
         .Chunk((int)chunkSize)
         .Select((chunk, n) =>
         {
-            if (stringComparison == StringComparison.Ordinal) RadixSort(chunk);
-            else Array.Sort(chunk, Comparer); 
+            //if (stringComparison == StringComparison.Ordinal) RadixSort(chunk);
+            //else
+            Array.Sort(chunk, Comparer); 
             var tempFileName = Path.Combine(dir, $"{fileName}-{unique}-{n}{fileExt}");
             WriteAllLines(tempFileName, Encoding.UTF8, chunk);
             return tempFileName;
         }).ToList();
 
 }
+
+fileReadOptions.BufferSize = 100 * 1024 * 1024 / tempFiles.Count;
 
 try
 {
@@ -94,9 +96,9 @@ int Comparer((string, int) x, (string, int) y)
 {
     var cmp = x.Item1.AsSpan(x.Item2 + 2).CompareTo(y.Item1.AsSpan(y.Item2 + 2), stringComparison);
     if (cmp != 0) return cmp;
-    return int.Parse(x.Item1.AsSpan(0, x.Item2))
+    return ulong.Parse(x.Item1.AsSpan(0, x.Item2))
             .CompareTo(
-                int.Parse(y.Item1.AsSpan(0, y.Item2))
+                ulong.Parse(y.Item1.AsSpan(0, y.Item2))
             );
 }
 
@@ -158,9 +160,9 @@ void RadixSortIntl(Span<(string, int)> linesWithDotPos, char maxChar, int charPo
         if (!sortStrings)
         {
             linesWithDotPos.Sort((x, y) =>
-                int.Parse(x.Item1.AsSpan(0, x.Item2))
+                ulong.Parse(x.Item1.AsSpan(0, x.Item2))
                     .CompareTo(
-                        int.Parse(y.Item1.AsSpan(0, y.Item2))
+                        ulong.Parse(y.Item1.AsSpan(0, y.Item2))
                     )
             );
             return;
@@ -195,4 +197,5 @@ void RadixSortIntl(Span<(string, int)> linesWithDotPos, char maxChar, int charPo
         }
         linesWithDotPos = linesWithDotPos[bin..];
     }
+
 }

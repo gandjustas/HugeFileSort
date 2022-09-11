@@ -1,8 +1,4 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Text;
-using System.Threading.Tasks;
+﻿using System.Buffers;
 
 namespace Sort
 {
@@ -33,7 +29,7 @@ namespace Sort
                     min.Dispose();
                     if (heap.Length == 1) yield break;
                     heap[0] = heap[^1];
-                    Array.Resize(ref heap, heap.Length-1);
+                    Array.Resize(ref heap, heap.Length - 1);
                 }
                 Heapify(heap, e => e.Current, 0, comparer);
             }
@@ -46,24 +42,26 @@ namespace Sort
             {
                 var leftChild = 2 * index + 1;
                 var rightChild = 2 * index + 2;
-                var v = selector(heap[index]);
+                var v = selector(heap[min]);
+
+                if (leftChild < heap.Length && comparer(v, selector(heap[leftChild])) > 0)
+                {
+                    min = leftChild;
+                    v = selector(heap[min]);
+                }
 
                 if (rightChild < heap.Length && comparer(v, selector(heap[rightChild])) > 0)
                 {
                     min = rightChild;
                 }
 
-                if (leftChild < heap.Length && comparer(v, selector(heap[leftChild])) > 0)
-                {
-                    min = leftChild;
-                }
 
                 if (min == index) break;
 
                 var temp = heap[index];
                 heap[index] = heap[min];
                 heap[min] = temp;
-                
+
                 index = min;
             }
         }
@@ -75,7 +73,5 @@ namespace Sort
                 Heapify(heap, selector, i, comparer);
             }
         }
-
-
     }
 }
