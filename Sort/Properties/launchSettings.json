@@ -1,0 +1,8 @@
+{
+  "profiles": {
+    "Sort": {
+      "commandName": "Project",
+      "commandLineArgs": "F:\\Projects\\HugeFileSort\\Sort\\bin\\Release\\net6.0\\publish\\win-x64\\smallFile.txt"
+    }
+  }
+}

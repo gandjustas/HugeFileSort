@@ -1,0 +1,8 @@
+{
+  "profiles": {
+    "SortBenchmark": {
+      "commandName": "Project",
+      "commandLineArgs": "F:\\Projects\\HugeFileSort\\Generate\\bin\\Release\\net6.0\\publish\\win-x64\\smallFile.txt"
+    }
+  }
+}

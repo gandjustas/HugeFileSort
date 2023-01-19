@@ -1,10 +1,15 @@
 ﻿using Sort;
 using System.Buffers;
+using System.IO.Pipelines;
+using System.Runtime.CompilerServices;
 using System.Text;
+using System.Threading;
+using System.Threading.Channels;
 
 //long DefaultChunkSize = GC.GetGCMemoryInfo().TotalAvailableMemoryBytes / (5 * 4 * 1024); //20% of memory, 4kb string ;
-long DefaultChunkSize = 100_000;
+int DefaultChunkSize = 100_000;
 const int FileBufferSize = 4 * 1024 * 1024; //4 MB
+
 
 if ((args?.Length ?? 0) == 0)
 {
@@ -19,59 +24,90 @@ var fileExt = Path.GetExtension(file);
 var unique = new Random().Next().ToString("X8");
 
 var chunkSize = args?.Length > 1 ? int.Parse(args[1]) : DefaultChunkSize;
+var degreeOfParralelism = args?.Length > 2 ? int.Parse(args[2]) : 2;
 
 var stringComparison = StringComparison.Ordinal;
 
-FileStreamOptions fileReadOptions = new()
+Encoding encoding = Encoding.UTF8;
+
+var stream = new FileStream(file, new FileStreamOptions { Mode = FileMode.Open, Access = FileAccess.Read, BufferSize = 0, Options = FileOptions.SequentialScan | FileOptions.Asynchronous });
+var size = stream.Length;
+
+var readChannel = Channel.CreateBounded<((string, int)[], bool)>(new BoundedChannelOptions(degreeOfParralelism)
 {
-    Options = FileOptions.SequentialScan,
-    BufferSize = FileBufferSize
-};
+    FullMode = BoundedChannelFullMode.Wait,
+    SingleReader = degreeOfParralelism == 1,
+    SingleWriter = true
+});
 
-FileStreamOptions fileWriteOptions = new()
+
+var pipeReader = new PipeChunkReader(stream, encoding, FileBufferSize, readChannel.Writer, chunkSize);
+
+var writeChnnel = Channel.CreateBounded<((string, int)[], bool)> (new BoundedChannelOptions(1)
 {
-    Mode = FileMode.Create,
-    Access = FileAccess.Write,
-    BufferSize = FileBufferSize
-};
+    FullMode = BoundedChannelFullMode.Wait,
+    SingleReader = true,
+    SingleWriter = degreeOfParralelism == 1
+});
 
-
-
-Encoding encoding;
-List<string> tempFiles;
-
-using (var reader = new StreamReader(file, Encoding.UTF8, true, fileReadOptions))
+async Task Sorter()
 {
-    encoding = reader.CurrentEncoding;
-    tempFiles = reader
-        .EnumerateLines()
-        .Select(l => (l, l.IndexOf('.')))
-        .Chunk((int)chunkSize)
-        .Select((chunk, n) =>
-        {
-            //if (stringComparison == StringComparison.Ordinal) RadixSort(chunk);
-            //else
-            Array.Sort(chunk, Comparer); 
-            var tempFileName = Path.Combine(dir, $"{fileName}-{unique}-{n}{fileExt}");
-            WriteAllLines(tempFileName, Encoding.UTF8, chunk);
-            return tempFileName;
-        }).ToList();
-
+    var reader = readChannel.Reader;
+    var writer = writeChnnel.Writer;
+    await foreach (var p in reader.ReadAllAsync())
+    {
+        Array.Sort(p.Item1, Comparer);
+        await writer.WriteAsync(p);
+    }
 }
 
-fileReadOptions.BufferSize = 100 * 1024 * 1024 / tempFiles.Count;
+var tasks = Task.WhenAll(
+    Task.Run(pipeReader.Process),
+    Task.WhenAll(Enumerable.Range(0,degreeOfParralelism).Select(_ => Task.Run(Sorter))).ContinueWith(_ => writeChnnel.Writer.Complete())
+);
 
+List<string> tempFiles = new((int)(stream.Length / chunkSize / 1024));
 try
 {
+    var reader = writeChnnel.Reader;
+    var counter = 0;
+    await foreach (var (chunk,r) in reader.ReadAllAsync())
+    {
+        var tempFileName = Path.Combine(dir!, $"{fileName}-{unique}-{counter}{fileExt}");
+        //using var output = new FileStream(tempFileName, new FileStreamOptions { Mode = FileMode.CreateNew, Access = FileAccess.Write, BufferSize = 0, Options = FileOptions.SequentialScan | FileOptions.Asynchronous });
+        //await WriteAllLinesAsync(output, encoding, chunk);
+        using var output = new StreamWriter(tempFileName, new FileStreamOptions { Mode = FileMode.CreateNew, Access = FileAccess.Write, BufferSize = 0, Options = FileOptions.SequentialScan });
+        WriteAllLines(output, chunk);
+        tempFiles.Add(tempFileName);
+        counter++;
+        if (r) ArrayPool<(string, int)>.Shared.Return(chunk);
+    };
+
+    await tasks;
+
     var files = tempFiles
-        .Select(f => new StreamReader(f, Encoding.UTF8, false, fileReadOptions))
+        .Select(f => new StreamReader(f, Encoding.UTF8, false, new FileStreamOptions { Options = FileOptions.SequentialScan, BufferSize = 100 * 1024 * 1024 / tempFiles.Count }))
         .ToList();
-    var lines = files
-        .Select(
-            f => f.EnumerateLines().Select(l => (l, l.IndexOf('.')))
-        ).MergeLines(Comparer);
-    WriteAllLines(file, encoding, lines);
-    files.ForEach(f => f.Dispose());
+    try
+    {
+        var lines = files
+            .Select(
+                f => f.EnumerateLines().Select(l => (l, l.IndexOf('.')))
+            ).MergeLines(Comparer);
+        using var output = new StreamWriter(file, encoding, new FileStreamOptions
+        {
+            Options = FileOptions.SequentialScan,
+            BufferSize = FileBufferSize,
+            Mode = FileMode.Create,            
+            Access = FileAccess.Write,
+            PreallocationSize = size
+        });
+        WriteAllLines(output, lines);
+    }
+    finally
+    {
+        files.ForEach(f => f.Dispose());
+    }
 }
 finally
 {
@@ -80,18 +116,31 @@ finally
 
 return 0;
 
-void WriteAllLines(string file, Encoding encoding, IEnumerable<(string, int)> linesWithDotPosition)
+void WriteAllLines(StreamWriter writer, IEnumerable<(string, int)> linesWithDotPosition)
 {
-    using (StreamWriter writer = new(file, encoding, fileWriteOptions))
+    writer.AutoFlush = false;
+    foreach (var (line, _) in linesWithDotPosition)
     {
-        writer.AutoFlush = false;
-        foreach (var (line, _) in linesWithDotPosition)
-        {
-            writer.WriteLine(line);
-        }
+        writer.WriteLine(line);
     }
 }
 
+async Task WriteAllLinesAsync(FileStream stream, Encoding encoding, IEnumerable<(string, int)> linesWithDotPosition)
+{
+    var writer = PipeWriter.Create(stream, new StreamPipeWriterOptions(minimumBufferSize: FileBufferSize));
+    var newLine = encoding.GetBytes(Environment.NewLine);
+    foreach (var (line, _) in linesWithDotPosition)
+    {
+        encoding.GetBytes(line, writer);
+        writer.Write(newLine);
+        if (writer.UnflushedBytes > FileBufferSize)
+        {
+            await writer.FlushAsync();
+        }
+    }
+    await writer.FlushAsync();
+    await writer.CompleteAsync();
+}
 int Comparer((string, int) x, (string, int) y)
 {
     var cmp = x.Item1.AsSpan(x.Item2 + 2).CompareTo(y.Item1.AsSpan(y.Item2 + 2), stringComparison);
