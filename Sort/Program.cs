@@ -19,36 +19,42 @@ var comparer = new Comparer(StringComparison.CurrentCulture);
 
 var sw = Stopwatch.StartNew();
 
-
-var count = 0;
+var culture = CultureInfo.CurrentCulture;
+var fileCount = 0;
 var tempFiles =
     File.ReadLines(file)  // Читаем построчно
         .Chunk(chunkSize) // Разбиваем на куски по 1М строк
         .Select(chunk =>
         {
-            var pairs = chunk.Select(line =>   
+            var pairs = ArrayPool<MySortKey>.Shared.Rent(chunkSize);
+            using var pooledMemory = MemoryPool<byte>.Shared.Rent(chunkSize * 256);
+            var m = pooledMemory.Memory;
+            var lineCount = 0;
+            foreach (var line in chunk)
             {
                 var dot = line.IndexOf('.');
 
                 // Обращение к KeyData вызывает Array.Clone на каждый вызов, поэтому наямую сортировать SortKey очень долго
                 // Получим массив один раз и сохраним отдельно
-                var sortKey = CultureInfo.CurrentCulture.CompareInfo.GetSortKey(line[(dot + 2)..]);
-                var bytes = sortKey.KeyData;
+                var l = line.AsSpan(dot + 2);
+                var sortKeyLength = culture.CompareInfo.GetSortKey(l, m.Span);
+
 
                 // Дописываем число из начала строки в конец массива ключа
                 // Отдельная сортировка по числу будет не нужна
-                Array.Resize(ref bytes, bytes.Length + sizeof(int));
                 var x = int.Parse(line.AsSpan(0, dot));
-                BinaryPrimitives.WriteInt32LittleEndian(bytes.AsSpan(bytes.Length - sizeof(int)), x);
+                BinaryPrimitives.WriteInt32LittleEndian(m.Slice(sortKeyLength).Span, x);
 
-                //Возвращаем свою структуру из строки и массива
-                return new MySortKey(line, bytes); 
-            }).ToArray();
-            RadixQuickSort<MySortKey, byte>(pairs.AsSpan());
+                //Сохраняем в массив
+                var len = sortKeyLength + sizeof(uint);
+                pairs[lineCount++] = new MySortKey(line, m[..len]);
+                m = m[len..];
+            }
+            RadixQuickSort<MySortKey, byte>(pairs.AsSpan(0, lineCount));
 
             // Сохраняем отсортированные строки в файл
-            var tempFileName = Path.ChangeExtension(file, $".part-{count++}" + Path.GetExtension(file));
-            File.WriteAllLines(tempFileName, pairs.Select(x => x.OriginalString)); 
+            var tempFileName = Path.ChangeExtension(file, $".part-{fileCount++}" + Path.GetExtension(file));
+            File.WriteAllLines(tempFileName, pairs.Take(lineCount).Select(x => x.OriginalString));
             return tempFileName;
         }).ToList();
 
@@ -212,10 +218,11 @@ public record Comparer(StringComparison stringComparison) : IComparer<(string, i
     }
 }
 
-public record struct MySortKey(string OriginalString, byte[] key) : IHasSortKey<byte>
+public record struct MySortKey(string OriginalString, Memory<byte> mem) : IHasSortKey<byte>
 {
     public Span<byte> GetSortKey()
     {
-        return key;
+        Debug.Assert(!mem.IsEmpty); // Метод не должен вызываться для неицициализированной структуры
+        return mem.Span;
     }
 }
