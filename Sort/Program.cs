@@ -22,7 +22,7 @@ using (var stream = File.OpenText(file))
         var charsRead = stream.ReadBlock(chunkBuffer, chunkReadPosition, chunkSize - chunkReadPosition);
         var m = chunkBuffer.AsMemory(0, chunkReadPosition + charsRead);
 
-        // Зполняем список строк ReadOnlyMemory<char> для сортировки
+        // Заполняем список строк ReadOnlyMemory<char> для сортировки
         int linePos;        
         while ((linePos = m.Span.IndexOf(Environment.NewLine)) >= 0)
         {
@@ -68,7 +68,7 @@ try
 {
     var mergedLines = tempFiles
         .Select(f => File.ReadLines(f).Select(s => (s.AsMemory(), s.IndexOf('.')))) // Читаем построчно все файлы, находим в строках точку
-        .Merge(comparer);  //Слияние итераторов IEnumerable<IEnumerable<(string,int)>> в IEnumerable<(string,int)>
+        .Merge(comparer);  //Слияние итераторов IEnumerable<IEnumerable<T>> в IEnumerable<T>
     using var sortedFile = File.CreateText(Path.ChangeExtension(file, ".sorted" + Path.GetExtension(file)));
     foreach (var (l, _) in mergedLines)
     {
