@@ -1,4 +1,6 @@
-﻿if ((args?.Length ?? 0) == 0)
+﻿using System.Text;
+
+if ((args?.Length ?? 0) == 0)
 {
     Console.WriteLine($"Usage: {Path.GetFileNameWithoutExtension(Environment.ProcessPath)} <file path> [<approximate chunk size>]");
     return -1;
@@ -12,18 +14,24 @@ var comparer = new Comparer(StringComparison.CurrentCulture);
 var sw = System.Diagnostics.Stopwatch.StartNew();
 List<string> tempFiles = new();
 List<(ReadOnlyMemory<char>, int)> chunk = new();
-using (var stream = File.OpenText(file))
+
+Encoding detectedEncoding;
+
+const int BufferSize = 1024 * 1024;
+using (var reader = new StreamReader(file, Encoding.Default, true, BufferSize))
 {
+    detectedEncoding = reader.CurrentEncoding;
+
     var chunkBuffer = new char[chunkSize];
     var chunkReadPosition = 0;
     while (true)
     {
         // Читаем из файла весь буфер
-        var charsRead = stream.ReadBlock(chunkBuffer, chunkReadPosition, chunkSize - chunkReadPosition);
+        var charsRead = reader.ReadBlock(chunkBuffer, chunkReadPosition, chunkSize - chunkReadPosition);
         var m = chunkBuffer.AsMemory(0, chunkReadPosition + charsRead);
 
         // Заполняем список строк ReadOnlyMemory<char> для сортировки
-        int linePos;        
+        int linePos;
         while ((linePos = m.Span.IndexOf(Environment.NewLine)) >= 0)
         {
             var line = m[..linePos];
@@ -32,26 +40,27 @@ using (var stream = File.OpenText(file))
         }
 
         // Если это был конец файла, то добавим в список последнюю строку, если она не пустая
-        if (stream.EndOfStream && m.Length > 0)
+        if (reader.EndOfStream && m.Length > 0)
         {
             chunk.Add((m, m.Span.IndexOf('.')));
         }
-
 
         chunk.Sort(comparer);
 
         // Записываем строки из отсортированного списка во временный файл
         var tempFileName = Path.ChangeExtension(file, $".part-{tempFiles.Count}" + Path.GetExtension(file));
-        using (var tempFile = File.CreateText(tempFileName))
+        using (var tempFile = new StreamWriter(tempFileName, false, reader.CurrentEncoding, BufferSize))
         {
+            tempFile.AutoFlush = false;
+
             foreach (var (l, _) in chunk)
             {
                 tempFile.WriteLine(l);
             }
         }
         tempFiles.Add(tempFileName);
-        
-        if (stream.EndOfStream) break;
+
+        if (reader.EndOfStream) break;
         chunk.Clear();
 
         //Отсток буфера переносим в начало
@@ -69,7 +78,9 @@ try
     var mergedLines = tempFiles
         .Select(f => File.ReadLines(f).Select(s => (s.AsMemory(), s.IndexOf('.')))) // Читаем построчно все файлы, находим в строках точку
         .Merge(comparer);  //Слияние итераторов IEnumerable<IEnumerable<T>> в IEnumerable<T>
-    using var sortedFile = File.CreateText(Path.ChangeExtension(file, ".sorted" + Path.GetExtension(file)));
+
+    using var sortedFile = new StreamWriter(Path.ChangeExtension(file, ".sorted" + Path.GetExtension(file)), false, detectedEncoding, BufferSize);
+    sortedFile.AutoFlush = false;
     foreach (var (l, _) in mergedLines)
     {
         sortedFile.WriteLine(l);
