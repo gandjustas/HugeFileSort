@@ -1,55 +1,107 @@
-﻿using System.Text;
+﻿using System.Buffers;
+using System.Diagnostics;
+using System.Text;
 
-if ((args?.Length ?? 0) == 0)
+
+internal class Program : IDisposable
 {
-    Console.WriteLine($"Usage: {Path.GetFileNameWithoutExtension(Environment.ProcessPath)} <file path> [<approximate chunk size>]");
-    return -1;
-}
 
-var file = args![0];
-var chunkSize = args?.Length > 1 ? (int.Parse(args[1]) * 1000_000 / 2) : (100_000_000); //In characters
+    const int BufferSize = 1024 * 1024;
 
-var comparer = new Comparer(StringComparison.CurrentCulture);
+    private string file;
+    private int chunkSize;
+    private StringComparison currentCulture;
+    Encoding detectedEncoding;
+    Comparer comparer;
+    List<string> tempFiles = new();
+    Random random = new();
 
-var sw = System.Diagnostics.Stopwatch.StartNew();
-List<string> tempFiles = new();
-List<(ReadOnlyMemory<char>, int)> chunk = new();
 
-Encoding detectedEncoding;
+    System.Diagnostics.Stopwatch timer = new();
 
-const int BufferSize = 1024 * 1024;
-using (var reader = new StreamReader(file, Encoding.Default, true, BufferSize))
-{
-    detectedEncoding = reader.CurrentEncoding;
 
-    var chunkBuffer = new char[chunkSize];
-    var chunkReadPosition = 0;
-    while (true)
+    public Program(string file, int chunkSize, StringComparison currentCulture)
     {
-        // Читаем из файла весь буфер
-        var charsRead = reader.ReadBlock(chunkBuffer, chunkReadPosition, chunkSize - chunkReadPosition);
-        var m = chunkBuffer.AsMemory(0, chunkReadPosition + charsRead);
+        this.file = file;
+        this.chunkSize = chunkSize;
+        this.currentCulture = currentCulture;
+        this.comparer = new Comparer(StringComparison.CurrentCulture);
+    }
+    public void Dispose()
+    {
+        tempFiles.ForEach(File.Delete);
+    }
 
-        // Заполняем список строк ReadOnlyMemory<char> для сортировки
-        int linePos;
-        while ((linePos = m.Span.IndexOf(Environment.NewLine)) >= 0)
+    public void SplitSort()
+    {
+        timer.Restart();
+
+        using var reader = new StreamReader(file, Encoding.Default, true, BufferSize);
+        detectedEncoding = reader.CurrentEncoding;
+
+        List<(ReadOnlyMemory<char>, int)> chunk = new();
+        var chunkBuffer = new char[chunkSize];
+        var chunkReadPosition = 0;
+        while (true)
         {
-            var line = m[..linePos];
-            chunk.Add((line, line.Span.IndexOf('.')));
-            m = m[(linePos + Environment.NewLine.Length)..];
-        }
+            var charsRead = reader.ReadBlock(chunkBuffer, chunkReadPosition, chunkSize - chunkReadPosition);
+            var eos = reader.EndOfStream;
+            var m = chunkBuffer.AsMemory(0, chunkReadPosition + charsRead);
 
-        // Если это был конец файла, то добавим в список последнюю строку, если она не пустая
-        if (reader.EndOfStream && m.Length > 0)
+            // Заполняем список строк ReadOnlyMemory<char> для сортировки
+            int linePos;
+            while ((linePos = m.Span.IndexOf(Environment.NewLine)) >= 0)
+            {
+                var line = m[..linePos];
+                chunk.Add((line, line.Span.IndexOf('.')));
+                m = m[(linePos + Environment.NewLine.Length)..];
+            }
+
+            // Если это был конец файла, то добавим в список последнюю строку, если она не пустая
+            if (eos && m.Length > 0)
+            {
+                chunk.Add((m, m.Span.IndexOf('.')));
+            }
+
+            chunk.Sort(comparer);
+
+            //Записываем чанки на диск
+            WriteChunk(chunk);
+
+            if (eos) break;
+            chunk.Clear();
+
+            //Отсток буфера переносим в начало
+            m.CopyTo(chunkBuffer);
+            chunkReadPosition = m.Length;
+        }
+        Console.WriteLine($"SplitSort done in {timer.Elapsed}");
+    }
+
+    public void Merge()
+    {
+        timer.Restart();
+
+        var mergedLines = tempFiles
+            .Select(f => File.ReadLines(f).Select(s => (s.AsMemory(), s.IndexOf('.')))) // Читаем построчно все файлы, находим в строках точку
+            .Merge(comparer);  //Слияние итераторов IEnumerable<IEnumerable<T>> в IEnumerable<T>
+
+        using var sortedFile = new StreamWriter(Path.ChangeExtension(file, ".sorted" + Path.GetExtension(file)), false, detectedEncoding, BufferSize);
+        sortedFile.AutoFlush = false;
+        foreach (var (l, _) in mergedLines)
         {
-            chunk.Add((m, m.Span.IndexOf('.')));
+            sortedFile.WriteLine(l);
         }
+        Console.WriteLine($"Merge done in {timer.Elapsed}");
+    }
 
-        chunk.Sort(comparer);
 
+
+    void WriteChunk(List<(ReadOnlyMemory<char>, int)> chunk)
+    {
         // Записываем строки из отсортированного списка во временный файл
         var tempFileName = Path.ChangeExtension(file, $".part-{tempFiles.Count}" + Path.GetExtension(file));
-        using (var tempFile = new StreamWriter(tempFileName, false, reader.CurrentEncoding, BufferSize))
+        using (var tempFile = new StreamWriter(tempFileName, false, Encoding.UTF8, BufferSize))
         {
             tempFile.AutoFlush = false;
 
@@ -59,52 +111,25 @@ using (var reader = new StreamReader(file, Encoding.Default, true, BufferSize))
             }
         }
         tempFiles.Add(tempFileName);
-
-        if (reader.EndOfStream) break;
-        chunk.Clear();
-
-        //Отсток буфера переносим в начало
-        m.CopyTo(chunkBuffer);
-        chunkReadPosition = m.Length;
     }
 
-}
-
-Console.WriteLine($"SplitSort done in {sw.Elapsed}");
-sw.Restart();
-
-try
-{
-    var mergedLines = tempFiles
-        .Select(f => File.ReadLines(f).Select(s => (s.AsMemory(), s.IndexOf('.')))) // Читаем построчно все файлы, находим в строках точку
-        .Merge(comparer);  //Слияние итераторов IEnumerable<IEnumerable<T>> в IEnumerable<T>
-
-    using var sortedFile = new StreamWriter(Path.ChangeExtension(file, ".sorted" + Path.GetExtension(file)), false, detectedEncoding, BufferSize);
-    sortedFile.AutoFlush = false;
-    foreach (var (l, _) in mergedLines)
+    private static int Main(string[] args)
     {
-        sortedFile.WriteLine(l);
+        if ((args?.Length ?? 0) == 0)
+        {
+            Console.WriteLine($"Usage: {Path.GetFileNameWithoutExtension(Environment.ProcessPath)} <file path> [<approximate chunk size>]");
+            return -1;
+        }
+
+        var file = args![0];
+        var chunkSize = args?.Length > 1 ? int.Parse(args[1]) * 1000_000 / 2 : 100_000_000; //In characters
+
+        using var app = new Program(file, chunkSize, StringComparison.CurrentCulture);
+        app.SplitSort();
+        app.Merge();
+
+        return 0;
     }
-}
-finally
-{
-    tempFiles.ForEach(f => File.Delete(f));
-}
-Console.WriteLine($"Merge done in {sw.Elapsed}");
 
-return 0;
-
-public record Comparer(StringComparison stringComparison) : IComparer<(ReadOnlyMemory<char>, int)>
-{
-    public int Compare((ReadOnlyMemory<char>, int) x, (ReadOnlyMemory<char>, int) y)
-    {
-        var spanX = x.Item1.Span;
-        var spanY = y.Item1.Span;
-        var xDot = x.Item2;
-        var yDot = y.Item2;
-
-        var cmp = spanX[(xDot + 2)..].CompareTo(spanY[(yDot + 2)..], stringComparison);
-        if (cmp != 0) return cmp;
-        return int.Parse(spanX[..xDot]) - int.Parse(spanY[..yDot]);
-    }
 }
+
