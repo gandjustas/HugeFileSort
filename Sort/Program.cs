@@ -10,7 +10,7 @@ internal class Program : IDisposable
 
     private string file;
     private int chunkSize;
-    private StringComparison currentCulture;
+    private StringComparison stringComparison;
     Encoding detectedEncoding;
     Comparer comparer;
     List<string> tempFiles = new();
@@ -24,7 +24,7 @@ internal class Program : IDisposable
     {
         this.file = file;
         this.chunkSize = chunkSize;
-        this.currentCulture = currentCulture;
+        this.stringComparison = currentCulture;
         this.comparer = new Comparer(StringComparison.CurrentCulture);
     }
     public void Dispose()
