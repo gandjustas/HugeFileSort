@@ -1,6 +1,6 @@
 ﻿public static class Exensions
 {
-    public static IEnumerable<T> Merge<T>(this IEnumerable<IEnumerable<T>> sources, IComparer<T> comparer = default)
+    public static IEnumerable<T> Merge<T>(this IEnumerable<IEnumerable<T>> sources, IComparer<T>? comparer = default)
     {
         var heap = (from source in sources
                     let e = source.GetEnumerator()
