@@ -13,10 +13,9 @@ using System.Text;
 internal class Program : IDisposable
 {
     const int BufferSize = 1024 * 1024;
-    const int BufferMargin = 4096;
     private static readonly byte[] NewLine = Encoding.UTF8.GetBytes(Environment.NewLine);
     private static readonly SortKeySelector selector = new SortKeySelector();
-    
+
     private readonly string file;
     private readonly int maxChunkSize;
     private readonly CultureInfo culture;
@@ -25,7 +24,7 @@ internal class Program : IDisposable
     private readonly Comparer comparer;
     private readonly List<string> tempFiles = new();
     int maxLineSize = 0;
-    int maxLineLength = 0;
+    int maxKeyLength = 0;
 
 
     System.Diagnostics.Stopwatch timer = new();
@@ -51,7 +50,7 @@ internal class Program : IDisposable
             _ => CompareOptions.None
         };
     }
-        public void Dispose()
+    public void Dispose()
     {
         tempFiles.ForEach(File.Delete);
     }
@@ -60,28 +59,28 @@ internal class Program : IDisposable
     {
         timer.Restart();
 
-        //using var reader = new StreamReader(file, encoding);
-        using var stream = new FileStream(file, FileMode.Open);
+        using var stream = new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.Read, 0, FileOptions.SequentialScan);
 
         List<SortKey> chunk = new();
 
-        var readBuffer = new byte[BufferMargin + maxChunkSize]; // BufferMargin запас для sortkey
+        var keyBuffer = new byte[maxChunkSize];
+        var readBuffer = new byte[maxChunkSize];
         var remainingBytes = 0;
 
-        var charBuffer = new char[maxChunkSize];
+        var charBuffer = new char[1024];
         var eof = false;
         while (!eof)
         {
-            var bytesRead = stream.ReadBlock(readBuffer, BufferMargin + remainingBytes, maxChunkSize - remainingBytes, out eof);
+            var bytesRead = stream.ReadBlock(readBuffer, remainingBytes, maxChunkSize - remainingBytes, out eof);
             int chunkSize = remainingBytes + bytesRead;
             if (!eof)
             {
-                var lastNewLine = readBuffer.AsSpan(BufferMargin, bytesRead).LastIndexOf(NewLine);
+                var lastNewLine = readBuffer.AsSpan(0, bytesRead).LastIndexOf(NewLine);
                 if (lastNewLine >= 0) chunkSize = lastNewLine + NewLine.Length;
                 remainingBytes = remainingBytes + bytesRead - chunkSize;
             }
 
-            chunk.AddRange(ParseChunk(readBuffer, BufferMargin, chunkSize, charBuffer));
+            chunk.AddRange(ParseChunk(chunkSize, readBuffer, keyBuffer, charBuffer));
 
             //Сортируем и записываем чанки на диск
             chunk.Sort(comparer);
@@ -93,61 +92,58 @@ internal class Program : IDisposable
             chunk.Clear();
 
             //Осаток буфера переносим в начало
-            if (remainingBytes > 0) readBuffer.AsSpan(BufferMargin + chunkSize, remainingBytes).CopyTo(readBuffer.AsSpan(BufferMargin));
+            if (remainingBytes > 0) readBuffer.AsSpan(chunkSize, remainingBytes).CopyTo(readBuffer.AsSpan());
         }
 
         Console.WriteLine($"SplitSort done in {timer.Elapsed}");
     }
 
-    private IEnumerable<SortKey> ParseChunk(byte[] readBuffer, int startIndex, int count, char[] charBuffer)
+    private IEnumerable<SortKey> ParseChunk(int byteCount, byte[] readBuffer, byte[] keyBuffer, char[] charBuffer)
     {
-        var charPosition = 0;
+        var readPos = 0;
         var sortKeyPos = 0;
-        while (count > 0)
+        while (byteCount > 0)
         {
-            var linePos = readBuffer.AsSpan(startIndex, count).IndexOf(NewLine);
-            if (linePos == -1) linePos = count;
+            var linePos = readBuffer.AsSpan(readPos, byteCount).IndexOf(NewLine);
+            if (linePos == -1) linePos = byteCount;
+            if (charBuffer.Length < linePos) charBuffer = new char[linePos];
 
-            var lineLen = encoding.GetChars(readBuffer, startIndex, linePos, charBuffer, charPosition);
-            var line = charBuffer.AsMemory(charPosition, lineLen);
+            var lineLen = encoding.GetChars(readBuffer, readPos, linePos, charBuffer, 0);
+            var line = charBuffer.AsMemory(0, lineLen);
             var dot = line.Span.IndexOf('.');
             var x = int.Parse(line.Span[0..dot]);
 
-            var sortKeyLen = culture.CompareInfo.GetSortKey(line.Span[(dot + 2)..], readBuffer.AsSpan(sortKeyPos, startIndex - sortKeyPos + linePos), compareOptions);
-            BinaryPrimitives.WriteInt32BigEndian(readBuffer.AsSpan(sortKeyPos + sortKeyLen, sizeof(int)), x);
+            var sortKeyLen = culture.CompareInfo.GetSortKey(line.Span[(dot + 2)..], keyBuffer.AsSpan(sortKeyPos), compareOptions);
+            BinaryPrimitives.WriteInt32BigEndian(keyBuffer.AsSpan(sortKeyPos + sortKeyLen, sizeof(int)), x);
             sortKeyLen += sizeof(int);
 
-            charPosition += lineLen;
-            startIndex += linePos + NewLine.Length;
-            count -= linePos + NewLine.Length;
+            var lineSize = linePos + NewLine.Length;
+            yield return new SortKey(readBuffer.AsMemory(readPos, lineSize), readBuffer.AsMemory(sortKeyPos, sortKeyLen));
 
-            yield return new SortKey(line, readBuffer.AsMemory(sortKeyPos, sortKeyLen));
+            readPos += lineSize;
+            byteCount -= lineSize;
             sortKeyPos += sortKeyLen;
-            maxLineSize = Math.Max(maxLineSize, linePos);
-            maxLineLength = Math.Max(maxLineLength, lineLen);
+            maxLineSize = Math.Max(maxLineSize, lineSize);
+            maxKeyLength = Math.Max(maxKeyLength, sortKeyLen);
         }
     }
 
-    char[]? line;
-    byte[]? writeBuffer;
     void WriteChunk(List<SortKey> chunk)
     {
-        line ??= new char[maxLineLength];
-        writeBuffer ??= new byte[maxLineSize * 2];
-
         // Записываем строки из отсортированного списка во временный файл
         var tempFileName = Path.ChangeExtension(file, $".part-{tempFiles.Count}.tmp");
-        using var tempFile = new FileStream(tempFileName, FileMode.Create, FileAccess.Write, FileShare.None, BufferSize);
-
+        using var tempFile = new FileStream(tempFileName, FileMode.Create, FileAccess.Write, FileShare.None, BufferSize, FileOptions.SequentialScan);
+        
+        Span<byte> buffer = stackalloc byte[sizeof(int)];
         foreach (var (line, key) in chunk)
         {
-            line.CopyTo(this.line);
-            var bytesConverted = encoding.GetBytes(this.line, 0, line.Length, writeBuffer, sizeof(int));
-            BinaryPrimitives.WriteInt32LittleEndian(writeBuffer, bytesConverted);
-            tempFile.Write(writeBuffer, 0, bytesConverted + sizeof(int));
-            BinaryPrimitives.WriteInt32LittleEndian(writeBuffer, key.Length);
-            key.CopyTo(writeBuffer.AsMemory(sizeof(int)));
-            tempFile.Write(writeBuffer, 0, key.Length + sizeof(int));            
+            BinaryPrimitives.WriteInt32LittleEndian(buffer, line.Length);
+            tempFile.Write(buffer);
+            tempFile.Write(line.Span);
+
+            BinaryPrimitives.WriteInt32LittleEndian(buffer, key.Length);
+            tempFile.Write(buffer);
+            tempFile.Write(key.Span);
         }
         tempFiles.Add(tempFileName);
     }
@@ -160,45 +156,44 @@ internal class Program : IDisposable
             .Select(ReadTempFile) // Читаем построчно все файлы, находим в строках точку
             .Merge(comparer);  //Слияние итераторов IEnumerable<IEnumerable<T>> в IEnumerable<T>
 
-        using var sortedFile = new StreamWriter(Path.ChangeExtension(file, ".sorted" + Path.GetExtension(file)), false, encoding, BufferSize);
-        sortedFile.AutoFlush = false;
+        string sortedFileName = Path.ChangeExtension(file, ".sorted" + Path.GetExtension(file));
+        using var sortedFile = new FileStream(sortedFileName, FileMode.Create, FileAccess.Write, FileShare.None, BufferSize, FileOptions.SequentialScan);
         foreach (var (l, _) in mergedLines)
         {
-            sortedFile.WriteLine(l);
+            sortedFile.Write(l.Span);
         }
         Console.WriteLine($"Merge done in {timer.Elapsed}");
     }
 
     private IEnumerable<SortKey> ReadTempFile(string file)
     {
-        using var stream = new FileStream(file, FileMode.Open);
+        using var stream = new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.Read, BufferSize, FileOptions.SequentialScan);
 
-        var readBuffer = new byte[BufferSize];
-        var lineBuffer = new char[maxLineLength];
+        var readBuffer = new byte[Math.Max(BufferSize, maxLineSize + maxLineSize + sizeof(int) * 2)];
 
         var bytesRemaining = 0;
         var eof = false;
 
         while (!eof)
         {
-            var parsePosition = 0;
-            var charsRead = stream.Read(readBuffer, bytesRemaining, readBuffer.Length - bytesRemaining);
-            if (charsRead == 0) eof = true;
-            bytesRemaining += charsRead;
+            var bytesRead = stream.ReadBlock(readBuffer, bytesRemaining, readBuffer.Length - bytesRemaining, out eof);
+            if (bytesRead == 0) eof = true;
+            bytesRemaining += bytesRead;
 
+            var parsePosition = 0;
             while (bytesRemaining - parsePosition > maxLineSize * 2 || (eof && parsePosition < bytesRemaining))
             {
 
                 var lineSize = BinaryPrimitives.ReadInt32LittleEndian(readBuffer.AsSpan(parsePosition, sizeof(int)));
                 parsePosition += sizeof(int);
 
-                var charCount = encoding.GetChars(readBuffer, parsePosition, lineSize, lineBuffer, 0);
+                var lineOffset = parsePosition;
                 parsePosition += lineSize;
 
                 var keyLen = BinaryPrimitives.ReadInt32LittleEndian(readBuffer.AsSpan(parsePosition, sizeof(int)));
                 parsePosition += sizeof(int);
 
-                yield return new SortKey(lineBuffer[..charCount], readBuffer.AsMemory(parsePosition, keyLen));
+                yield return new SortKey(readBuffer.AsMemory(lineOffset, lineSize), readBuffer.AsMemory(parsePosition, keyLen));
                 parsePosition += keyLen;
             }
 
@@ -217,7 +212,7 @@ internal class Program : IDisposable
         }
 
         var file = args![0];
-        var chunkSize = args?.Length > 1 ? int.Parse(args[1])  : 200; //В мегабайтах
+        var chunkSize = args?.Length > 1 ? int.Parse(args[1]) : 200; //В мегабайтах
 
 
         using var app = new Program(file, chunkSize * 1024 * 1024 / 2, StringComparison.CurrentCulture);
