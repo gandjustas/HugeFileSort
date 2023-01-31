@@ -2,20 +2,21 @@
 {
     public static int ReadBlock(this Stream stream, byte[] buffer, int stratIndex, int count, out bool eof)
     {
-        var totlaBytesRead = 0;
+        var totalBytesRead = 0;
         eof = false;
-        while (totlaBytesRead < count)
+        while (totalBytesRead < count)
         {
-            var charsRead = stream.Read(buffer, stratIndex + totlaBytesRead, count - totlaBytesRead);
+            var charsRead = stream.Read(buffer, stratIndex + totalBytesRead, count - totalBytesRead);
             if (charsRead == 0)
             {
                 eof = true;
                 break;
             }
-            totlaBytesRead += charsRead;
+            totalBytesRead += charsRead;
         }
-        return totlaBytesRead;
+        return totalBytesRead;
     }
+
     public static IEnumerable<T> Merge<T>(this IEnumerable<IEnumerable<T>> sources, IComparer<T>? comparer = default)
     {
         var heap = (from source in sources
