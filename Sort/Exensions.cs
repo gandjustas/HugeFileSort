@@ -1,5 +1,21 @@
 ﻿public static class Exensions
 {
+    public static int ReadBlock(this Stream stream, byte[] buffer, int stratIndex, int count, out bool eof)
+    {
+        var totlaBytesRead = 0;
+        eof = false;
+        while (totlaBytesRead < count)
+        {
+            var charsRead = stream.Read(buffer, stratIndex + totlaBytesRead, count - totlaBytesRead);
+            if (charsRead == 0)
+            {
+                eof = true;
+                break;
+            }
+            totlaBytesRead += charsRead;
+        }
+        return totlaBytesRead;
+    }
     public static IEnumerable<T> Merge<T>(this IEnumerable<IEnumerable<T>> sources, IComparer<T>? comparer = default)
     {
         var heap = (from source in sources
