@@ -4,7 +4,7 @@ using System.Linq;
 using System.Text;
 using System.Threading.Tasks;
 
-record struct SortKey(ReadOnlyMemory<char> OriginalString, ReadOnlyMemory<byte> Key);
+record struct SortKey(ReadOnlyMemory<byte> Key, long Offset, int Length);
 
 public class SortKeySelector : SortHelpers.ISortKeySelector<SortKey, byte>
 {
