@@ -24,6 +24,7 @@ internal class Program : IDisposable
     private readonly List<string> tempFiles = new();
     int maxLineSize = 0;
     int maxKeyLength = 0;
+    long fileSize = 0;
 
 
     System.Diagnostics.Stopwatch timer = new();
@@ -59,6 +60,7 @@ internal class Program : IDisposable
         timer.Restart();
 
         using var stream = new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.Read, 0, FileOptions.SequentialScan);
+        fileSize = stream.Length;
 
         List<SortKey> chunk = new();
 
@@ -117,7 +119,7 @@ internal class Program : IDisposable
             sortKeyLen += sizeof(int);
 
             var lineSize = linePos + NewLine.Length;
-            yield return new SortKey(readBuffer.AsMemory(readPos, lineSize), readBuffer.AsMemory(sortKeyPos, sortKeyLen));
+            yield return new SortKey(readBuffer.AsMemory(readPos, lineSize), keyBuffer.AsMemory(sortKeyPos, sortKeyLen));
 
             readPos += lineSize;
             byteCount -= lineSize;
@@ -157,6 +159,7 @@ internal class Program : IDisposable
 
         string sortedFileName = Path.ChangeExtension(file, ".sorted" + Path.GetExtension(file));
         using var sortedFile = new FileStream(sortedFileName, FileMode.Create, FileAccess.Write, FileShare.None, BufferSize, FileOptions.SequentialScan);
+        sortedFile.SetLength(fileSize);
         foreach (var (l, _) in mergedLines)
         {
             sortedFile.Write(l.Span);
@@ -211,8 +214,7 @@ internal class Program : IDisposable
         }
 
         var file = args![0];
-        var chunkSize = args?.Length > 1 ? int.Parse(args[1]) : 200; //В мегабайтах
-
+        var chunkSize = args?.Length > 1 ? int.Parse(args[1]) : 200; //В мегабайтах        
 
         using var app = new Program(file, chunkSize * 1024 * 1024 / 2, StringComparison.CurrentCulture);
         app.SplitSort();
