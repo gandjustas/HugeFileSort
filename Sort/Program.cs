@@ -14,7 +14,6 @@ internal class Program : IDisposable
 {
     const int BufferSize = 1024 * 1024;
     private static readonly byte[] NewLine = Encoding.UTF8.GetBytes(Environment.NewLine);
-    private static readonly SortKeySelector selector = new SortKeySelector();
 
     private readonly string file;
     private readonly int maxChunkSize;
