@@ -1,10 +1,14 @@
-﻿using System;
+﻿using Microsoft.Extensions.Configuration;
+using System;
 using System.Buffers;
 using System.Buffers.Binary;
 using System.Collections.Generic;
+using System.ComponentModel.DataAnnotations;
 using System.Diagnostics;
 using System.Globalization;
 using System.IO;
+using System.IO.Compression;
+using System.Reflection.Metadata.Ecma335;
 using System.Runtime;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
@@ -20,7 +24,7 @@ internal class Program : IDisposable
     private readonly int maxChunkSize;
     private readonly int degreeOfParallelism;
     private readonly CultureInfo culture;
-    private readonly Encoding encoding = Encoding.UTF8;
+    private readonly Encoding encoding;
     private readonly CompareOptions compareOptions;
     private readonly Comparer comparer;
     private readonly List<string> tempFiles = new();
@@ -33,12 +37,15 @@ internal class Program : IDisposable
 
     private Channel<(byte[], int)> readToParse;
     private Channel<(List<SortKey>, byte[], byte[])> parseToSort;
-    private Channel<(List<SortKey>, byte[], byte[])> sortToWrite;
+    private Channel<(List<SortKey>, byte[], byte[])> sortToCompress;
+    private Channel<(byte[], int)> compressToWrite;
     private Task[] parserThreads;
     private Task[] sorterThreads;
+    private Task[] compressThreads;
     private Task writerThread;
+    private ArrayPool<byte>? pool = ArrayPool<byte>.Create();
 
-    public Program(string file, int chunkSize, StringComparison stringComparison, int degreeOfParallelism)
+    public Program(string file, Encoding encoding, StringComparison stringComparison, int chunkSize, int degreeOfParallelism)
     {
         this.file = file;
         this.maxChunkSize = chunkSize;
@@ -58,6 +65,7 @@ internal class Program : IDisposable
             StringComparison.InvariantCultureIgnoreCase => CompareOptions.IgnoreCase,
             _ => CompareOptions.None
         };
+        this.encoding = encoding;
     }
     public void Dispose()
     {
@@ -67,8 +75,8 @@ internal class Program : IDisposable
     public async Task SplitSort()
     {
         timer.Restart();
-        
-        var pool = PrepareParallelWork();
+
+        PrepareParallelWork();
 
         using var stream = new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.Read, 0, FileOptions.SequentialScan);
         fileSize = stream.Length;
@@ -77,7 +85,7 @@ internal class Program : IDisposable
         byte[]? keyBuffer = null;
         char[]? charBuffer = null;
 
-        var readBuffer = pool.Rent(maxChunkSize);
+        var readBuffer = pool!.Rent(maxChunkSize);
         var remainingBytes = 0;
         var eof = false;
 
@@ -102,9 +110,9 @@ internal class Program : IDisposable
             else
             {
                 chunk ??= new();
-                
-                chunk.AddRange(ParseChunk(chunkSize, readBuffer, 
-                    keyBuffer ??= pool.Rent(maxChunkSize), 
+
+                chunk.AddRange(ParseChunk(chunkSize, readBuffer,
+                    keyBuffer ??= pool.Rent(maxChunkSize),
                     charBuffer ??= new char[1024]));
 
                 //Сортируем и записываем чанки на диск
@@ -117,20 +125,23 @@ internal class Program : IDisposable
             if (remainingBytes > 0) oldBuffer.AsSpan(chunkSize, remainingBytes).CopyTo(readBuffer.AsSpan());
         }
 
-        if(degreeOfParallelism == 0)
+        if (degreeOfParallelism == 0)
         {
             if (readBuffer != null) pool.Return(readBuffer);
             if (keyBuffer != null) pool.Return(keyBuffer);
         }
 
         await CompleteParralelWork();
+        
+        pool = null;
+        GCSettings.LargeObjectHeapCompactionMode = GCLargeObjectHeapCompactionMode.CompactOnce;
+        GC.Collect(2);
+
         Console.WriteLine($"SplitSort done in {timer.Elapsed}");
     }
 
-    private ArrayPool<byte> PrepareParallelWork()
+    private void PrepareParallelWork()
     {
-        var pool = ArrayPool<byte>.Create();
-
         if (degreeOfParallelism > 0)
         {
 
@@ -144,7 +155,12 @@ internal class Program : IDisposable
                 SingleWriter = degreeOfParallelism == 1,
                 SingleReader = degreeOfParallelism == 1
             });
-            sortToWrite = Channel.CreateBounded<(List<SortKey>, byte[], byte[])>(new BoundedChannelOptions(1)
+            sortToCompress = Channel.CreateBounded<(List<SortKey>, byte[], byte[])>(new BoundedChannelOptions(1)
+            {
+                SingleWriter = degreeOfParallelism == 1,
+                SingleReader = degreeOfParallelism == 1
+            });
+            compressToWrite = Channel.CreateBounded<(byte[], int)>(new BoundedChannelOptions(1)
             {
                 SingleWriter = degreeOfParallelism == 1,
                 SingleReader = true
@@ -153,54 +169,140 @@ internal class Program : IDisposable
             parserThreads =
                 Enumerable
                 .Range(0, degreeOfParallelism)
-                .Select(_ => Task.Run(async () => {
-                    var charBuffer = new char[1024];
-                    await foreach (var (readBuffer, chunkSize) in readToParse.Reader.ReadAllAsync())
-                    {
-                        var keyBuffer = pool.Rent(maxChunkSize);
-                        var chunk = ParseChunk(chunkSize, readBuffer, keyBuffer, charBuffer).ToList();
-                        await parseToSort.Writer.WriteAsync((chunk, readBuffer, keyBuffer));
-
-                    }
-                })).ToArray();
+                .Select(_ => Task.Run(ParallelParser)).ToArray();
 
             sorterThreads =
                 Enumerable
                 .Range(0, degreeOfParallelism)
-                .Select(_ => Task.Run(async () => {
-                    await foreach (var item in parseToSort.Reader.ReadAllAsync())
-                    {
-                        item.Item1.Sort(comparer);
-                        await sortToWrite.Writer.WriteAsync(item);
+                .Select(_ => Task.Run(ParallelSorter)).ToArray();
 
-                    }
-                })).ToArray();
+            compressThreads =
+                Enumerable
+                .Range(0, degreeOfParallelism)
+                .Select(_ => Task.Run(ParallelCompressor)).ToArray();
 
-            writerThread = Task.Run(async () => {
-                await foreach (var (chunk, readBuffer, keyBuffer) in sortToWrite.Reader.ReadAllAsync())
+            writerThread = Task.Run(ParallelWriter);
+        }
+    }
+
+    private async Task ParallelParser()
+    {
+        var charBuffer = new char[1024];
+        await foreach (var (readBuffer, chunkSize) in readToParse.Reader.ReadAllAsync())
+        {
+            var keyBuffer = pool!.Rent(maxChunkSize);
+            var chunk = ParseChunk(chunkSize, readBuffer, keyBuffer, charBuffer).ToList();
+            await parseToSort.Writer.WriteAsync((chunk, readBuffer, keyBuffer));
+
+        }
+    }
+
+    private async Task ParallelSorter()
+    {
+        await foreach (var item in parseToSort.Reader.ReadAllAsync())
+        {
+            item.Item1.Sort(comparer);
+            await sortToCompress.Writer.WriteAsync(item);
+        }
+    }
+
+    private async Task ParallelCompressor()
+    {
+        var buffer = new byte[1024]; //Buffer with margin
+        var outputSize = maxChunkSize / 2;
+        await foreach (var (chunk, readBuffer, keyBuffer) in sortToCompress.Reader.ReadAllAsync())
+        {
+            using var encoder = new BrotliEncoder(4, 22);
+            var output = pool!.Rent(outputSize);
+            var dest = output.AsMemory();
+
+            var compressed = 0;
+            var bufferSize = 0;
+            foreach (var sk in chunk)
+            {
+                if (sk.Length > buffer.Length)
                 {
-                    WriteChunk(chunk);
-                    pool.Return(readBuffer);
-                    pool.Return(keyBuffer);
+                    buffer = new byte[sk.Length];
                 }
-            });
-        };
 
-        return pool;
+                sk.Write(buffer, bufferSize);
+
+                var source = buffer.AsMemory(0, sk.Length);
+                while (true)
+                {
+                    var r = encoder.Compress(source.Span, dest.Span, out var bytesConsumed, out var bytesWritten, false);
+                    compressed += bytesWritten;
+                    if (bytesConsumed > 0) source = source[bytesConsumed..];
+                    if (bytesWritten > 0) dest = dest[bytesWritten..];
+                    if (r == OperationStatus.Done) break;
+                    if (r == OperationStatus.InvalidData || r == OperationStatus.NeedMoreData)
+                    {
+                        throw new InvalidOperationException();
+                    }
+                    var old = output;
+                    outputSize *= 2;
+                    output = pool.Rent(outputSize);
+                    dest = output.AsMemory();
+
+                    old.CopyTo(output, 0);
+                    pool.Return(old);
+
+                }
+            }
+
+            while (true)
+            {
+                var r = encoder.Flush(dest.Span, out var bytesWritten);
+                compressed += bytesWritten;
+                if (r == OperationStatus.Done) break;
+                if (r == OperationStatus.InvalidData || r == OperationStatus.NeedMoreData)
+                {
+                    throw new InvalidOperationException();
+                }
+                var old = output;
+                outputSize *= 2;
+                output = pool.Rent(outputSize);
+                dest = output.AsMemory();
+
+                old.CopyTo(output, 0);
+                pool.Return(old);
+
+            }
+            outputSize = compressed * 11 / 10;
+            await compressToWrite.Writer.WriteAsync((output, compressed));
+
+            pool.Return(readBuffer);
+            pool.Return(keyBuffer);
+        }
+    }
+
+    private async Task ParallelWriter()
+    {
+        await foreach (var (buffer, bufferLength) in compressToWrite.Reader.ReadAllAsync())
+        {
+            var tempFileName = Path.ChangeExtension(file, $".part-{tempFiles.Count}.tmp");
+            using (var tempFile = new FileStream(tempFileName, FileMode.Create, FileAccess.Write, FileShare.None, 0, FileOptions.SequentialScan))
+            { 
+                await tempFile.WriteAsync(buffer.AsMemory(0, bufferLength));
+            }
+            pool!.Return(buffer);
+            tempFiles.Add(tempFileName);
+        }
     }
 
     private async Task CompleteParralelWork()
     {
-        if(degreeOfParallelism > 0)
+        if (degreeOfParallelism > 0)
         {
             readToParse.Writer.Complete();
             await Task.WhenAll(parserThreads);
             parseToSort.Writer.Complete();
             await Task.WhenAll(sorterThreads);
-            sortToWrite.Writer.Complete();
+            sortToCompress.Writer.Complete();
+            await Task.WhenAll(compressThreads);
+            compressToWrite.Writer.Complete();
             await writerThread;
-            GCSettings.LargeObjectHeapCompactionMode = GCLargeObjectHeapCompactionMode.CompactOnce;
-            GC.Collect(2);
+
         }
     }
 
@@ -239,7 +341,8 @@ internal class Program : IDisposable
         // Записываем строки из отсортированного списка во временный файл
         var tempFileName = Path.ChangeExtension(file, $".part-{tempFiles.Count}.tmp");
         using var tempFile = new FileStream(tempFileName, FileMode.Create, FileAccess.Write, FileShare.None, BufferSize, FileOptions.SequentialScan);
-        
+        //using var stream = new BrotliStream(tempFile, CompressionLevel.Optimal);
+
         Span<byte> buffer = stackalloc byte[sizeof(int)];
         foreach (var (line, key) in chunk)
         {
@@ -274,7 +377,8 @@ internal class Program : IDisposable
 
     private IEnumerable<SortKey> ReadTempFile(string file)
     {
-        using var stream = new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.Read, BufferSize, FileOptions.SequentialScan);
+        using var f = new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.Read, 0, FileOptions.SequentialScan);
+        using var stream = degreeOfParallelism == 0 ? (Stream)f : new BrotliStream(f, CompressionMode.Decompress);
 
         var readBuffer = new byte[Math.Max(BufferSize, maxLineSize + maxLineSize + sizeof(int) * 2)];
 
@@ -290,7 +394,6 @@ internal class Program : IDisposable
             var parsePosition = 0;
             while (bytesRemaining - parsePosition > maxLineSize * 2 || (eof && parsePosition < bytesRemaining))
             {
-
                 var lineSize = BinaryPrimitives.ReadInt32LittleEndian(readBuffer.AsSpan(parsePosition, sizeof(int)));
                 parsePosition += sizeof(int);
 
@@ -314,14 +417,57 @@ internal class Program : IDisposable
     {
         if ((args?.Length ?? 0) == 0)
         {
-            Console.WriteLine($"Usage: {Path.GetFileNameWithoutExtension(Environment.ProcessPath)} <file path> [<approximate chunk size> in MB]");
+            Console.WriteLine($"Usage: {Path.GetFileNameWithoutExtension(Environment.ProcessPath)} <file path> [options]");
             return -1;
         }
 
-        var file = args![0];
-        var chunkSize = args?.Length > 1 ? int.Parse(args[1]) : 100; //В мегабайтах
+        Dictionary<string, string> switchMappings = new()
+               {
+                   { "-d", "dop" },
+                   { "-s", "size" },
+                   { "-m", "mode" },
+                   { "-e", "enc" },
+                   { "--dop", "dop" },
+                   { "--size", "size" },
+                   { "--mode", "mode" },
+                   { "--encoding", "enc" },
+               };
+        var config = new ConfigurationBuilder()
+            .AddCommandLine(args!, switchMappings)
+            .Build();
 
-        using var app = new Program(file, chunkSize * 1024 * 1024 / 2, StringComparison.CurrentCulture, Environment.ProcessorCount / 8);
+
+
+        if (!int.TryParse(config["dop"], out var dop))
+        {
+#if DEBUG
+            dop = 1;
+#else
+            dop = Environment.ProcessorCount < 3 ? 0 : (1 + (Environment.ProcessorCount - 3) / 4);
+#endif
+        }
+        dop = int.Clamp(dop, 0, Environment.ProcessorCount);
+
+        var maxMem = GC.GetGCMemoryInfo().HighMemoryLoadThresholdBytes / (1024 * 1024);
+        if (!int.TryParse(config["size"], out var chunkSize))
+        {
+            chunkSize = (int)maxMem / 20 / (4 + 4 * dop);
+        }
+        chunkSize = int.Clamp(chunkSize, 100, int.MaxValue / (1024 * 1024));
+
+
+        if (!Enum.TryParse<StringComparison>(config["mode"], out var comparison))
+        {
+            comparison = StringComparison.CurrentCulture;
+        }
+
+        var encoding = Encoding.UTF8;
+        var enc = config["enc"];
+        if (enc != null) encoding = Encoding.GetEncoding(enc);
+        
+
+        var file = args![0];
+        using var app = new Program(file, encoding, comparison, chunkSize * 1024 * 1024, dop);
         await app.SplitSort();
         app.Merge();
 
