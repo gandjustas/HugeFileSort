@@ -30,7 +30,7 @@ record struct SortKey(ReadOnlyMemory<byte> OriginalString, ReadOnlyMemory<byte> 
     }
 }
 
-public record Comparer(StringComparison StringComparison)
+public class Comparer
     : IComparer<SortKey>
 {
     int IComparer<SortKey>.Compare(SortKey x, SortKey y)
