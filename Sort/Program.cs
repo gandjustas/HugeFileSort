@@ -1,42 +1,40 @@
-﻿if ((args?.Length ?? 0) == 0)
+﻿using System.IO;
+using System.Reflection.PortableExecutable;
+
+if ((args?.Length ?? 0) == 0)
 {
     Console.WriteLine($"Usage: {Path.GetFileNameWithoutExtension(Environment.ProcessPath)} <file path> [<approximate chunk size>]");
     return -1;
 }
 
 var file = args![0];
-var chunkSize = args?.Length > 1 ? (int.Parse(args[1]) * 1000_000 / 2) : (100_000_000); //In characters
+var chunkSize = args?.Length > 1 ? (int.Parse(args[1]) * 1000_000 / 2) : 100_000_000; //In characters
 
 var comparer = new Comparer(StringComparison.CurrentCulture);
 
 var sw = System.Diagnostics.Stopwatch.StartNew();
 List<string> tempFiles = new();
-List<(ReadOnlyMemory<char>, int)> chunk = new();
-using (var stream = File.OpenText(file))
+List<Item> chunk = new();
+using (var reader = File.OpenText(file))
 {
     var chunkBuffer = new char[chunkSize];
     var chunkReadPosition = 0;
-    while (true)
+    var eos = reader.EndOfStream;
+    while (!eos)
     {
         // Читаем из файла весь буфер
-        var charsRead = stream.ReadBlock(chunkBuffer, chunkReadPosition, chunkSize - chunkReadPosition);
+        var charsRead = reader.ReadBlock(chunkBuffer.AsSpan(chunkReadPosition));
+        eos = reader.EndOfStream;
         var m = chunkBuffer.AsMemory(0, chunkReadPosition + charsRead);
 
         // Заполняем список строк ReadOnlyMemory<char> для сортировки
-        int linePos;        
-        while ((linePos = m.Span.IndexOf(Environment.NewLine)) >= 0)
+        int linePos;
+        while ((linePos = m.Span.IndexOf(Environment.NewLine)) >= 0 || (eos && m.Length > 0))
         {
-            var line = m[..linePos];
-            chunk.Add((line, line.Span.IndexOf('.')));
+            var line = linePos >= 0 ? m[..linePos] : m;
+            chunk.Add(new Item(line, line.Span.IndexOf('.')));
             m = m[(linePos + Environment.NewLine.Length)..];
         }
-
-        // Если это был конец файла, то добавим в список последнюю строку, если она не пустая
-        if (stream.EndOfStream && m.Length > 0)
-        {
-            chunk.Add((m, m.Span.IndexOf('.')));
-        }
-
 
         chunk.Sort(comparer);
 
@@ -50,15 +48,14 @@ using (var stream = File.OpenText(file))
             }
         }
         tempFiles.Add(tempFileName);
-        
-        if (stream.EndOfStream) break;
+
+        if (eos) break;
         chunk.Clear();
 
         //Отсток буфера переносим в начало
         m.CopyTo(chunkBuffer);
         chunkReadPosition = m.Length;
     }
-
 }
 
 Console.WriteLine($"SplitSort done in {sw.Elapsed}");
@@ -67,9 +64,10 @@ sw.Restart();
 try
 {
     var mergedLines = tempFiles
-        .Select(f => File.ReadLines(f).Select(s => (s.AsMemory(), s.IndexOf('.')))) // Читаем построчно все файлы, находим в строках точку
+        .Select(f => File.ReadLines(f).Select(s => new Item(s.AsMemory(), s.IndexOf('.')))) // Читаем построчно все файлы, находим в строках точку
         .Merge(comparer);  //Слияние итераторов IEnumerable<IEnumerable<T>> в IEnumerable<T>
     using var sortedFile = File.CreateText(Path.ChangeExtension(file, ".sorted" + Path.GetExtension(file)));
+
     foreach (var (l, _) in mergedLines)
     {
         sortedFile.WriteLine(l);
@@ -77,22 +75,23 @@ try
 }
 finally
 {
-    tempFiles.ForEach(f => File.Delete(f));
+    tempFiles.ForEach(File.Delete);
 }
 Console.WriteLine($"Merge done in {sw.Elapsed}");
 
 return 0;
 
-public record Comparer(StringComparison stringComparison) : IComparer<(ReadOnlyMemory<char>, int)>
+public record struct Item(ReadOnlyMemory<char> Line, int DotPosition);
+public record Comparer(StringComparison StringComparison) : IComparer<Item>
 {
-    public int Compare((ReadOnlyMemory<char>, int) x, (ReadOnlyMemory<char>, int) y)
+    public int Compare(Item x, Item y)
     {
-        var spanX = x.Item1.Span;
-        var spanY = y.Item1.Span;
-        var xDot = x.Item2;
-        var yDot = y.Item2;
+        var spanX = x.Line.Span;
+        var spanY = y.Line.Span;
+        var xDot = x.DotPosition;
+        var yDot = y.DotPosition;
 
-        var cmp = spanX[(xDot + 2)..].CompareTo(spanY[(yDot + 2)..], stringComparison);
+        var cmp = spanX[(xDot + 2)..].CompareTo(spanY[(yDot + 2)..], StringComparison);
         if (cmp != 0) return cmp;
         return int.Parse(spanX[..xDot]) - int.Parse(spanY[..yDot]);
     }
