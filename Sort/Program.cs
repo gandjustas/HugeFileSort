@@ -5,6 +5,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
 using System.IO;
+using System.IO.Compression;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -34,7 +35,7 @@ internal class Program : IDisposable
     {
         this.file = file;
         this.maxChunkSize = chunkSize;
-        this.comparer = new Comparer(stringComparison);
+        this.comparer = new Comparer();
         this.culture = stringComparison switch
         {
             StringComparison.InvariantCulture => CultureInfo.InvariantCulture,
@@ -133,18 +134,19 @@ internal class Program : IDisposable
     {
         // Записываем строки из отсортированного списка во временный файл
         var tempFileName = Path.ChangeExtension(file, $".part-{tempFiles.Count}.tmp");
-        using var tempFile = new FileStream(tempFileName, FileMode.Create, FileAccess.Write, FileShare.None, BufferSize, FileOptions.SequentialScan);
+        using var tempFile = new FileStream(tempFileName, FileMode.Create, FileAccess.Write, FileShare.None, 0, FileOptions.SequentialScan);
+        using var stream = new BrotliStream(tempFile, CompressionMode.Compress);
         
         Span<byte> buffer = stackalloc byte[sizeof(int)];
         foreach (var (line, key) in chunk)
         {
             BinaryPrimitives.WriteInt32LittleEndian(buffer, line.Length);
-            tempFile.Write(buffer);
-            tempFile.Write(line.Span);
+            stream.Write(buffer);
+            stream.Write(line.Span);
 
             BinaryPrimitives.WriteInt32LittleEndian(buffer, key.Length);
-            tempFile.Write(buffer);
-            tempFile.Write(key.Span);
+            stream.Write(buffer);
+            stream.Write(key.Span);
         }
         tempFiles.Add(tempFileName);
     }
@@ -158,7 +160,7 @@ internal class Program : IDisposable
             .Merge(comparer);  //Слияние итераторов IEnumerable<IEnumerable<T>> в IEnumerable<T>
 
         string sortedFileName = Path.ChangeExtension(file, ".sorted" + Path.GetExtension(file));
-        using var sortedFile = new FileStream(sortedFileName, FileMode.Create, FileAccess.Write, FileShare.None, BufferSize, FileOptions.SequentialScan);
+        using var sortedFile = new FileStream(sortedFileName, FileMode.Create);
         sortedFile.SetLength(fileSize);
         foreach (var (l, _) in mergedLines)
         {
@@ -169,7 +171,8 @@ internal class Program : IDisposable
 
     private IEnumerable<SortKey> ReadTempFile(string file)
     {
-        using var stream = new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.Read, BufferSize, FileOptions.SequentialScan);
+        using var f = new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.Read, 0, FileOptions.SequentialScan);
+        using var stream = new BrotliStream(f, CompressionMode.Decompress);
 
         var readBuffer = new byte[Math.Max(BufferSize, maxLineSize + maxLineSize + sizeof(int) * 2)];
 
@@ -209,14 +212,15 @@ internal class Program : IDisposable
     {
         if ((args?.Length ?? 0) == 0)
         {
-            Console.WriteLine($"Usage: {Path.GetFileNameWithoutExtension(Environment.ProcessPath)} <file path> [<approximate chunk size> in MB]");
+            Console.WriteLine($"Usage: {Path.GetFileNameWithoutExtension(Environment.ProcessPath)} <file path> [<max chunk size> in MB]");
             return -1;
         }
 
         var file = args![0];
         var chunkSize = args?.Length > 1 ? int.Parse(args[1]) : 200; //В мегабайтах        
+        chunkSize = int.Clamp(chunkSize, 100, int.MaxValue / (1024 * 1024));
 
-        using var app = new Program(file, chunkSize * 1024 * 1024 / 2, StringComparison.CurrentCulture);
+        using var app = new Program(file, chunkSize * 1024 * 1024, StringComparison.CurrentCulture);
         app.SplitSort();
         app.Merge();
 
