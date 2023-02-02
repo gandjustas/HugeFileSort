@@ -23,22 +23,31 @@
                     let e = source.GetEnumerator()
                     where e.MoveNext()
                     select e).ToArray();
-
-        var enumeratorComparer = new EnumeratorComparer<T>(comparer ?? Comparer<T>.Default);
-        heap.AsSpan().BuildHeap(enumeratorComparer);
-
-        while (true)
+        try
         {
-            var min = heap[0];
-            yield return min.Current;
-            if (!min.MoveNext())
+            var enumeratorComparer = new EnumeratorComparer<T>(comparer ?? Comparer<T>.Default);
+            heap.AsSpan().BuildHeap(enumeratorComparer);
+
+            while (true)
             {
-                min.Dispose();
-                if (heap.Length == 1) yield break;
-                heap[0] = heap[^1];
-                Array.Resize(ref heap, heap.Length - 1);
+                var min = heap[0];
+                yield return min.Current;
+                if (!min.MoveNext())
+                {
+                    min.Dispose();
+                    if (heap.Length == 1) yield break;
+                    heap[0] = heap[^1];
+                    Array.Resize(ref heap, heap.Length - 1);
+                }
+                heap.AsSpan().Heapify(0, enumeratorComparer);
             }
-            heap.AsSpan().Heapify(0, enumeratorComparer);
+        }
+        finally
+        {
+            foreach (var e in heap)
+            {
+                e.Dispose();
+            }
         }
     }
 
