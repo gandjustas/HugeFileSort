@@ -103,30 +103,32 @@ internal class Program : IDisposable
     private IEnumerable<SortKey> ParseChunk(int byteCount, byte[] readBuffer, byte[] keyBuffer, char[] charBuffer)
     {
         var readPos = 0;
-        var sortKeyPos = 0;
+        var key = keyBuffer.AsMemory();
         while (byteCount > 0)
         {
             var linePos = readBuffer.AsSpan(readPos, byteCount).IndexOf(NewLine);
             if (linePos == -1) linePos = byteCount;
             if (charBuffer.Length < linePos) charBuffer = new char[linePos];
 
+            // Надо обязательно вызывать именно эту перегрузку, потому что остальные аллоцируют память
             var lineLen = encoding.GetChars(readBuffer, readPos, linePos, charBuffer, 0);
             var line = charBuffer.AsMemory(0, lineLen);
-            var dot = line.Span.IndexOf('.');
-            var x = int.Parse(line.Span[0..dot]);
+            var s = line.Span;
+            var dot = s.IndexOf('.');
+            var x = int.Parse(s[0..dot]);
 
-            var sortKeyLen = culture.CompareInfo.GetSortKey(line.Span[(dot + 2)..], keyBuffer.AsSpan(sortKeyPos), compareOptions);
-            BinaryPrimitives.WriteInt32BigEndian(keyBuffer.AsSpan(sortKeyPos + sortKeyLen, sizeof(int)), x);
-            sortKeyLen += sizeof(int);
+            var keyLen = culture.CompareInfo.GetSortKey(s[(dot + 2)..], key.Span, compareOptions);
+            BinaryPrimitives.WriteInt32BigEndian(key[keyLen..].Span, x);
+            keyLen += sizeof(int);
 
             var lineSize = linePos + NewLine.Length;
-            yield return new SortKey(readBuffer.AsMemory(readPos, lineSize), keyBuffer.AsMemory(sortKeyPos, sortKeyLen));
+            yield return new SortKey(readBuffer.AsMemory(readPos, lineSize), key[..keyLen]);
+            key = key[keyLen..];
 
             readPos += lineSize;
             byteCount -= lineSize;
-            sortKeyPos += sortKeyLen;
             maxLineSize = Math.Max(maxLineSize, lineSize);
-            maxKeyLength = Math.Max(maxKeyLength, sortKeyLen);
+            maxKeyLength = Math.Max(maxKeyLength, keyLen);
         }
     }
 
@@ -136,7 +138,7 @@ internal class Program : IDisposable
         var tempFileName = Path.ChangeExtension(file, $".part-{tempFiles.Count}.tmp");
         using var tempFile = new FileStream(tempFileName, FileMode.Create, FileAccess.Write, FileShare.None, 0, FileOptions.SequentialScan);
         using var stream = new BrotliStream(tempFile, CompressionMode.Compress);
-        
+
         Span<byte> buffer = stackalloc byte[sizeof(int)];
         foreach (var (line, key) in chunk)
         {
@@ -160,7 +162,7 @@ internal class Program : IDisposable
             .Merge(comparer);  //Слияние итераторов IEnumerable<IEnumerable<T>> в IEnumerable<T>
 
         string sortedFileName = Path.ChangeExtension(file, ".sorted" + Path.GetExtension(file));
-        using var sortedFile = new FileStream(sortedFileName, FileMode.Create);
+        using var sortedFile = new FileStream(sortedFileName, FileMode.Create, FileAccess.Write, FileShare.None, BufferSize, FileOptions.SequentialScan);
         sortedFile.SetLength(fileSize);
         foreach (var (l, _) in mergedLines)
         {
@@ -174,7 +176,8 @@ internal class Program : IDisposable
         using var f = new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.Read, 0, FileOptions.SequentialScan);
         using var stream = new BrotliStream(f, CompressionMode.Decompress);
 
-        var readBuffer = new byte[Math.Max(BufferSize, maxLineSize + maxLineSize + sizeof(int) * 2)];
+        var maxBlockSize = maxLineSize + maxKeyLength + sizeof(int) * 2;
+        var readBuffer = new byte[Math.Max(BufferSize, maxBlockSize)];
 
         var bytesRemaining = 0;
         var eof = false;
@@ -183,29 +186,28 @@ internal class Program : IDisposable
         {
             var bytesRead = stream.ReadBlock(readBuffer, bytesRemaining, readBuffer.Length - bytesRemaining, out eof);
             if (bytesRead == 0) eof = true;
-            bytesRemaining += bytesRead;
+            var mem = readBuffer.AsMemory(0, bytesRemaining + bytesRead);
 
-            var parsePosition = 0;
-            while (bytesRemaining - parsePosition > maxLineSize * 2 || (eof && parsePosition < bytesRemaining))
+            while (mem.Length > maxBlockSize || (eof && mem.Length > 0))
             {
 
-                var lineSize = BinaryPrimitives.ReadInt32LittleEndian(readBuffer.AsSpan(parsePosition, sizeof(int)));
-                parsePosition += sizeof(int);
+                var lineSize = BinaryPrimitives.ReadInt32LittleEndian(mem.Span);
+                mem = mem[sizeof(int)..];
 
-                var lineOffset = parsePosition;
-                parsePosition += lineSize;
+                var line = mem[..lineSize];
+                mem = mem[lineSize..];
 
-                var keyLen = BinaryPrimitives.ReadInt32LittleEndian(readBuffer.AsSpan(parsePosition, sizeof(int)));
-                parsePosition += sizeof(int);
+                var keyLen = BinaryPrimitives.ReadInt32LittleEndian(mem.Span);
+                mem = mem[sizeof(int)..];
 
-                yield return new SortKey(readBuffer.AsMemory(lineOffset, lineSize), readBuffer.AsMemory(parsePosition, keyLen));
-                parsePosition += keyLen;
+                yield return new SortKey(line, mem[..keyLen]);
+                mem = mem[keyLen..];
             }
 
-            readBuffer.AsSpan(parsePosition).CopyTo(readBuffer);
-            bytesRemaining -= parsePosition;
-        }
+            mem.CopyTo(readBuffer);
 
+            bytesRemaining = mem.Length;
+        }
     }
 
     private static int Main(string[] args)

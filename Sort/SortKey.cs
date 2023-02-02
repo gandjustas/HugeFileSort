@@ -6,7 +6,7 @@ using System.Threading.Tasks;
 
 record struct SortKey(ReadOnlyMemory<byte> OriginalString, ReadOnlyMemory<byte> Key);
 
-public record Comparer()
+public class Comparer
     : IComparer<SortKey>
 {
     int IComparer<SortKey>.Compare(SortKey x, SortKey y)
