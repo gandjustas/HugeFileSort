@@ -1,26 +1,26 @@
 ﻿if ((args?.Length ?? 0) == 0)
 {
-    Console.WriteLine($"Usage: {Path.GetFileNameWithoutExtension(Environment.ProcessPath)} <file path> [<chunk size>]");
+    Console.WriteLine($"Usage: {Path.GetFileNameWithoutExtension(Environment.ProcessPath)} <file path>");
     return -1;
 }
 
 var file = args![0];
-var chunkSize = args?.Length > 1 ? int.Parse(args[1]) : 1_000_000;
+var chunkSize = 1_000_000;
 
-var comparer = new Comparer(StringComparison.InvariantCultureIgnoreCase);
+var comparer = new Comparer(StringComparison.CurrentCulture);
 
 var sw = System.Diagnostics.Stopwatch.StartNew();
 
 var count = 0;
 var tempFiles =
     File.ReadLines(file)
-        .Select(s => (s, s.IndexOf('.')))
+        .Select(s => new Item(s, s.IndexOf('.')))
         .Chunk(chunkSize)
         .Select(chunk =>
         {
             Array.Sort(chunk, comparer);
             var tempFileName = Path.ChangeExtension(file, $".part-{count++}" + Path.GetExtension(file));
-            File.WriteAllLines(tempFileName, chunk.Select(x => x.Item1));
+            File.WriteAllLines(tempFileName, chunk.Select(x => x.Line));
             return tempFileName;
         }).ToList();
 
@@ -30,29 +30,29 @@ sw.Restart();
 try
 {
     var mergedLines = tempFiles
-        .Select(f => File.ReadLines(f).Select(s => (s, s.IndexOf('.'))))
-        .Merge(comparer)
-        .Select(x => x.Item1);
+        .Select(f => File.ReadLines(f).Select(s => new Item(s, s.IndexOf('.'))))
+        .Merge(comparer) // IEnumerable<IEnumerable<T>> -> IEnumerable<T>
+        .Select(x => x.Line);
     File.WriteAllLines(Path.ChangeExtension(file, ".sorted" + Path.GetExtension(file)), mergedLines);
 }
 finally
 {
-    tempFiles.ForEach(f => File.Delete(f));
+    tempFiles.ForEach(File.Delete);
 }
 Console.WriteLine($"Merge done in {sw.Elapsed}");
 
 return 0;
-
-public record Comparer(StringComparison stringComparison) : IComparer<(string, int)>
+public record struct Item(string Line, int DotPosition);
+public record Comparer(StringComparison StringComparison) : IComparer<Item>
 {
-    public int Compare((string, int) x, (string, int) y)
+    public int Compare(Item x, Item y)
     {
-        var spanX = x.Item1.AsSpan();
-        var spanY = y.Item1.AsSpan();
-        var xDot = x.Item2;
-        var yDot = y.Item2;
+        var spanX = x.Line.AsSpan();
+        var spanY = y.Line.AsSpan();
+        var xDot = x.DotPosition;
+        var yDot = y.DotPosition;
 
-        var cmp = spanX[(xDot + 2)..].CompareTo(spanY[(yDot + 2)..], stringComparison);
+        var cmp = spanX[(xDot + 2)..].CompareTo(spanY[(yDot + 2)..], StringComparison);
         if (cmp != 0) return cmp;
         return int.Parse(spanX[..xDot]) - int.Parse(spanY[..yDot]);
     }
