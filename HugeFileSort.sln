@@ -9,6 +9,8 @@ Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "Sort", "Sort\Sort.csproj", 
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Benchmarks", "Benchmarks\Benchmarks.csproj", "{64D71475-492D-476D-B3E9-738DB88D96B6}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "MemoryMappedFileExtensions", "MemoryMappedFileExtensions\MemoryMappedFileExtensions.csproj", "{5175EA78-EFF8-4434-863F-1561A20F20F5}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -27,6 +29,10 @@ Global
 		{64D71475-492D-476D-B3E9-738DB88D96B6}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{64D71475-492D-476D-B3E9-738DB88D96B6}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{64D71475-492D-476D-B3E9-738DB88D96B6}.Release|Any CPU.Build.0 = Release|Any CPU
+		{5175EA78-EFF8-4434-863F-1561A20F20F5}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{5175EA78-EFF8-4434-863F-1561A20F20F5}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{5175EA78-EFF8-4434-863F-1561A20F20F5}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{5175EA78-EFF8-4434-863F-1561A20F20F5}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

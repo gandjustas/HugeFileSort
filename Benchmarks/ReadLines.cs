@@ -3,6 +3,7 @@ using System;
 using System.Buffers;
 using System.Collections;
 using System.Collections.Generic;
+using System.IO.MemoryMappedFiles;
 using System.IO.Pipelines;
 using System.Linq;
 using System.Net.Mail;
@@ -154,7 +155,7 @@ public class ReadLines
     private IEnumerable<ReadOnlyMemory<byte>> IterateStreamNoBuffering(FileStream stream, int bufferSize)
     {
         var chunkBuffer = new byte[bufferSize * 2];
-        Memory<byte> m = new ();
+        Memory<byte> m = new();
         while (true)
         {
             var charsRead = stream.Read(chunkBuffer, bufferSize, chunkBuffer.Length / 2);
@@ -174,8 +175,8 @@ public class ReadLines
                 m = m[(linePos + NewLine.Length)..];
             }
 
-            
-            m.CopyTo(chunkBuffer.AsMemory(bufferSize - m.Length,m.Length));
+
+            m.CopyTo(chunkBuffer.AsMemory(bufferSize - m.Length, m.Length));
         }
     }
 
@@ -296,6 +297,31 @@ public class ReadLines
         Span<char> line = stackalloc char[bytes.Length];
         Encoding.UTF8.GetChars(bytes, line);
         Noop(line);
+    }
+
+
+    [Benchmark]
+    public void IterateMemoryMappedFile()
+    {
+
+        using var mmf = MemoryMappedFile.CreateFromFile(file);
+        using var accessor = mmf.CreateViewAccessor();
+        using var owner = accessor.UnsafeGetMemory();
+        foreach (var mem in IterateSpan(owner.Memory))
+        {
+            ProcessBytes(mem);
+        }
+    }
+
+    private IEnumerable<ReadOnlyMemory<byte>> IterateSpan(ReadOnlyMemory<byte> source)
+    {
+        int linePos;
+        while ((linePos = source.Span.IndexOf(NewLine)) >= 0)
+        {
+            yield return source[..linePos];
+            source = source[(linePos + NewLine.Length)..];
+        }
+        if (source.Length > 0) yield return source;
     }
 
 }

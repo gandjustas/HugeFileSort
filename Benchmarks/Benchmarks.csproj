@@ -13,6 +13,10 @@
   </ItemGroup>
 
   <ItemGroup>
+    <ProjectReference Include="..\MemoryMappedFileExtensions\MemoryMappedFileExtensions.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
     <None Update="testfile.txt">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
