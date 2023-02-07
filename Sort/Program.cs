@@ -312,17 +312,9 @@ internal class Program : IDisposable
         {
             var linePos = readBuffer.AsSpan(readPos, byteCount).IndexOf(NewLine);
             if (linePos == -1) linePos = byteCount;
-            if (charBuffer.Length < linePos) charBuffer = new char[linePos];
-
-            // Надо обязательно вызывать именно эту перегрузку, потому что остальные аллоцируют память
-            var lineLen = encoding.GetChars(readBuffer, readPos, linePos, charBuffer, 0);
-            var line = charBuffer.AsMemory(0, lineLen);
-            var s = line.Span;
-            var dot = s.IndexOf('.');
-            var x = int.Parse(s[0..dot]);
-
-            var keyLen = culture.CompareInfo.GetSortKey(s[(dot + 2)..], key.Span, compareOptions);
-            BinaryPrimitives.WriteInt32BigEndian(key[keyLen..].Span, x);
+            int keyLen = this.compareOptions == CompareOptions.Ordinal 
+                ? WriteKeyOrdinal(readBuffer, readPos, linePos, key)
+                : WriteKeyCulture(readBuffer, readPos, linePos, key, ref charBuffer);
             keyLen += sizeof(int);
 
             var lineSize = linePos + NewLine.Length;
@@ -334,6 +326,48 @@ internal class Program : IDisposable
             maxLineSize = Math.Max(maxLineSize, lineSize);
             maxKeyLength = Math.Max(maxKeyLength, keyLen);
         }
+    }
+
+    private int WriteKeyOrdinal(byte[] source, int offset, int length, Memory<byte> destination)
+    {
+        var s = source.AsSpan(offset, length);
+            
+        var dot = s.IndexOf((byte)'.');
+        
+        var x = 0;
+        var num = s[0..dot];
+        var negative = false;
+        if (num[0] == (byte)'-') {
+            negative = true;
+            num = num[1..];
+        }
+        while(num.Length > 0) {
+            x = x * 10 + (num[0] - (byte)'0');
+            num= num[1..];
+        }
+
+        if(negative) x = -x;
+
+        s = s[(dot + 2)..];
+        s.CopyTo(destination.Span);
+        BinaryPrimitives.WriteInt32BigEndian(destination[s.Length..].Span, x);
+
+        return s.Length + sizeof(int);
+    }
+
+    private int WriteKeyCulture(byte[] source, int offset, int length, Memory<byte> destination, ref char[] charBuffer)
+    {
+        if (charBuffer.Length < length) charBuffer = new char[length];
+
+        // Надо обязательно вызывать именно эту перегрузку, потому что остальные аллоцируют память
+        var lineLen = encoding.GetChars(source, offset, length, charBuffer, 0);
+        var line = charBuffer.AsMemory(0, lineLen);
+        var s = line.Span;
+        var dot = s.IndexOf('.');
+        var x = int.Parse(s[0..dot]);
+        var keyLen = culture.CompareInfo.GetSortKey(s[(dot + 2)..], destination.Span, compareOptions);
+        BinaryPrimitives.WriteInt32BigEndian(destination[keyLen..].Span, x);
+        return keyLen;
     }
 
     void WriteChunk(List<SortKey> chunk)
