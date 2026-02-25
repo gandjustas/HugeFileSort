@@ -1,11 +1,14 @@
 ﻿using System.Buffers;
 using System.CommandLine;
+using System.Data;
 using System.Diagnostics;
 using System.IO.Pipelines;
+using System.Numerics;
+using System.Runtime.InteropServices;
 
 Argument<FileInfo> source = new("source")
 {
-    Description = "Source file to sort",
+    Description = "Source file to sort or check",
 };
 Argument<FileInfo> destination = new("destination")
 {
@@ -26,44 +29,111 @@ sort.SetAction((r, ct) => Sort(
     r.GetValue(destination),
     ct));
 
+Command check = new("check-sorted", "Check file is sorted")
+{
+    Arguments = {
+        ArgumentValidation.AcceptExistingOnly(source),
+    },
+};
+check.SetAction((r, ct) => Check(
+    r.GetRequiredValue(source),
+    ct));
 
-RootCommand rootCommand = [sort];
+
+RootCommand rootCommand = [sort, check];
 
 var parseResult = rootCommand.Parse(args);
-if (parseResult.Errors.Count == 0)
-{
-    var sw = Stopwatch.StartNew();
-    await parseResult.InvokeAsync();
-    Console.WriteLine(sw.Elapsed);
-}
-else
-{
-    await parseResult.InvokeAsync();
-}
+return await parseResult.InvokeAsync();
 
+static async Task<int> Check(FileInfo source, CancellationToken ct)
+{
+    var encoding = System.Text.Encoding.UTF8;
+    var newLine = encoding.GetBytes(Environment.NewLine);
+    var reader = PipeReader.Create(source.OpenRead());
 
+    (string? s, long x) last = (null, 0L);
+    var sorted = true;
+    await ProcessLines(reader, newLine, line =>
+    {
+        var dotPos = line.IndexOf((byte)'.');
+        var x = long.Parse(line[..dotPos], null);
+        var s = encoding.GetString(line[(dotPos + 2)..]);
+        var cmp = s.CompareTo(last.s);
+        sorted = sorted && cmp >= 0 && (cmp > 0 || x >= last.x);
+        last = (s, x);
+    }, ct);
+    return sorted ? 0 : 1;
+
+}
 
 
 static async Task Sort(FileInfo source, FileInfo? destination, CancellationToken ct)
 {
+    var sw = Stopwatch.StartNew();
+
     if (destination is null)
     {
         var file = source.FullName;
         destination = new FileInfo(Path.ChangeExtension(file, ".sorted" + Path.GetExtension(file)));
     }
     var reader = PipeReader.Create(source.OpenRead());
-    var writer = PipeWriter.Create(destination.OpenWrite());
 
-    await CopyLines(reader, writer, ct);
-    await reader.CompleteAsync();
-    await writer.CompleteAsync();
-}
-
-static async Task CopyLines(PipeReader reader, PipeWriter writer, CancellationToken ct)
-{
     var encoding = System.Text.Encoding.UTF8;
     var newLine = encoding.GetBytes(Environment.NewLine);
+    StringToUtf8BytesComparer comparer = new(encoding, Random.Shared.Next());
+    var dict = await ReadDictionary<long>(reader, newLine, comparer, ct);
 
+    var sorted = dict
+        .AsParallel()
+        .Select(x => { x.Value.Sort(); return (x.Key, x.Value); })
+        .OrderBy(p => p.Key);
+
+    var writer = PipeWriter.Create(destination.OpenWrite());
+    foreach (var (line, values) in sorted)
+    {
+        foreach (var value in values)
+        {
+            writer.Write(value, "d");
+            writer.Write(". ", encoding);
+            writer.Write(line, encoding);
+            writer.Write(newLine);
+        }
+        await writer.FlushAsync(ct);
+    }
+    await reader.CompleteAsync();
+    await writer.CompleteAsync();
+    
+    Console.WriteLine(sw.Elapsed);
+}
+
+static async Task<IReadOnlyDictionary<string, List<T>>> ReadDictionary<T>(PipeReader reader, byte[] newLine, IEqualityComparer<string> comparer, CancellationToken ct) where T : struct, INumberBase<T>
+{
+    Dictionary<string, List<T>> d = new(comparer);
+    var l = d.GetAlternateLookup<ReadOnlySpan<byte>>();
+    await ProcessLines(reader, newLine, line =>
+    {
+        var dotPos = line.IndexOf((byte)'.');
+        var x = T.Parse(line[..dotPos], null);
+        line = line[(dotPos + 2)..];
+
+        ref var list = ref CollectionsMarshal.GetValueRefOrAddDefault(l, line, out bool exist);
+        if (!exist)
+        {
+            list = [x];
+        }
+        else
+        {
+            list!.Add(x);
+        }
+
+    }, ct);
+
+    return d;
+}
+
+
+static async Task ProcessLines(PipeReader reader, byte[] newLine, Action<ReadOnlySpan<byte>> processLine, CancellationToken ct)
+{
     while (true)
     {
         var result = await reader.ReadAsync(ct);
@@ -73,8 +143,7 @@ static async Task CopyLines(PipeReader reader, PipeWriter writer, CancellationTo
         {
             while (sequenceReader.TryReadTo(out ReadOnlySpan<byte> line, newLine))
             {
-                writer.Write(line);
-                writer.Write(newLine);
+                processLine(line);
             }
 
             buffer = buffer.Slice(sequenceReader.Position);
@@ -82,7 +151,6 @@ static async Task CopyLines(PipeReader reader, PipeWriter writer, CancellationTo
         }
 
         reader.AdvanceTo(buffer.Start, buffer.End);
-        await writer.FlushAsync(ct);
         if (result.IsCompleted) break;
     }
 }
