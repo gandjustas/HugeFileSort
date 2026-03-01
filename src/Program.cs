@@ -16,6 +16,10 @@ Argument<FileInfo> destination = new("destination")
     Arity = ArgumentArity.ZeroOrOne
 };
 
+Argument<int> size = new("size")
+{
+    Description = "Minimum size of file in MB",
+};
 
 Command sort = new("sort", "Sort huge file")
 {
@@ -40,10 +44,59 @@ check.SetAction((r, ct) => Check(
     ct));
 
 
-RootCommand rootCommand = [sort, check];
+Command generate = new("generate", "Generate huge file")
+{
+    Arguments = {
+        ArgumentValidation.AcceptLegalFilePathsOnly(destination),
+        size
+    },
+};
+
+generate.SetAction((r, ct) => Generate(
+    r.GetRequiredValue(destination),
+    r.GetRequiredValue(size),
+    ct));
+
+
+RootCommand rootCommand = [sort, check, generate];
 
 var parseResult = rootCommand.Parse(args);
 return await parseResult.InvokeAsync();
+
+static async Task Generate(FileInfo file, int size, CancellationToken ct)
+{
+    var encoding = System.Text.Encoding.UTF8;
+    var newLine = encoding.GetBytes(Environment.NewLine);
+    var random = Random.Shared;
+    var buffer = new char[1024];
+    long written = 0;
+    
+    var writer = PipeWriter.Create(file.Create());
+    while (written < size * 1024L* 1024L)
+    {
+        writer.Write(random.Next(), "d");        
+        writer.Write(". ", encoding);        
+        writer.Write(RandomString(random, random.Next(buffer.Length), buffer), encoding);
+        writer.Write(newLine);
+        if(writer.UnflushedBytes > size)
+        {
+            written += writer.UnflushedBytes;
+            await writer.FlushAsync(ct);
+        }
+    }
+
+    await writer.CompleteAsync();
+}
+
+static ReadOnlySpan<char> RandomString(Random random, int length, Span<char> span)
+{
+    const string chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    for (int i = 0; i < length; i++)
+    {
+        span[i] = chars[random.Next(chars.Length)];
+    }
+    return span[..length];
+}
 
 static async Task<int> Check(FileInfo source, CancellationToken ct)
 {
@@ -102,7 +155,7 @@ static async Task Sort(FileInfo source, FileInfo? destination, CancellationToken
     }
     await reader.CompleteAsync();
     await writer.CompleteAsync();
-    
+
     Console.WriteLine(sw.Elapsed);
 }
 
