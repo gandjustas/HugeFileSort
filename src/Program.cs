@@ -1,10 +1,6 @@
 ﻿using System.Buffers;
 using System.CommandLine;
-using System.Data;
-using System.Diagnostics;
 using System.IO.Pipelines;
-using System.Numerics;
-using System.Runtime.InteropServices;
 
 Argument<FileInfo> source = new("source")
 {
@@ -28,10 +24,13 @@ Command sort = new("sort", "Sort huge file")
         ArgumentValidation.AcceptLegalFilePathsOnly(destination)
     },
 };
-sort.SetAction((r, ct) => Sort(
-    r.GetRequiredValue(source),
-    r.GetValue(destination),
-    ct));
+sort.SetAction((r, ct) => 
+    new Sorter<long>(
+        r.GetRequiredValue(source),
+        r.GetValue(destination),
+        System.Text.Encoding.UTF8)
+    .Sort(ct)
+    );
 
 Command check = new("check-sorted", "Check file is sorted")
 {
@@ -106,7 +105,7 @@ static async Task<int> Check(FileInfo source, CancellationToken ct)
 
     (string? s, long x) last = (null, 0L);
     var sorted = true;
-    await ProcessLines(reader, newLine, line =>
+    await reader.ProcessLines(newLine, line =>
     {
         var dotPos = line.IndexOf((byte)'.');
         var x = long.Parse(line[..dotPos], null);
@@ -117,93 +116,4 @@ static async Task<int> Check(FileInfo source, CancellationToken ct)
     }, ct);
     return sorted ? 0 : 1;
 
-}
-
-
-static async Task Sort(FileInfo source, FileInfo? destination, CancellationToken ct)
-{
-    var sw = Stopwatch.StartNew();
-
-    if (destination is null)
-    {
-        var file = source.FullName;
-        destination = new FileInfo(Path.ChangeExtension(file, ".sorted" + Path.GetExtension(file)));
-    }
-    var reader = PipeReader.Create(source.OpenRead());
-
-    var encoding = System.Text.Encoding.UTF8;
-    var newLine = encoding.GetBytes(Environment.NewLine);
-    StringToUtf8BytesComparer comparer = new(encoding, Random.Shared.Next());
-    var dict = await ReadDictionary<long>(reader, newLine, comparer, ct);
-
-    var sorted = dict
-        .AsParallel()
-        .Select(x => { x.Value.Sort(); return (x.Key, x.Value); })
-        .OrderBy(p => p.Key);
-
-    var writer = PipeWriter.Create(destination.OpenWrite());
-    foreach (var (line, values) in sorted)
-    {
-        foreach (var value in values)
-        {
-            writer.Write(value, "d");
-            writer.Write(". ", encoding);
-            writer.Write(line, encoding);
-            writer.Write(newLine);
-        }
-        await writer.FlushAsync(ct);
-    }
-    await reader.CompleteAsync();
-    await writer.CompleteAsync();
-
-    Console.WriteLine(sw.Elapsed);
-}
-
-static async Task<IReadOnlyDictionary<string, List<T>>> ReadDictionary<T>(PipeReader reader, byte[] newLine, IEqualityComparer<string> comparer, CancellationToken ct) where T : struct, INumberBase<T>
-{
-    Dictionary<string, List<T>> d = new(comparer);
-    var l = d.GetAlternateLookup<ReadOnlySpan<byte>>();
-    await ProcessLines(reader, newLine, line =>
-    {
-        var dotPos = line.IndexOf((byte)'.');
-        var x = T.Parse(line[..dotPos], null);
-        line = line[(dotPos + 2)..];
-
-        ref var list = ref CollectionsMarshal.GetValueRefOrAddDefault(l, line, out bool exist);
-        if (!exist)
-        {
-            list = [x];
-        }
-        else
-        {
-            list!.Add(x);
-        }
-
-    }, ct);
-
-    return d;
-}
-
-
-static async Task ProcessLines(PipeReader reader, byte[] newLine, Action<ReadOnlySpan<byte>> processLine, CancellationToken ct)
-{
-    while (true)
-    {
-        var result = await reader.ReadAsync(ct);
-        var buffer = result.Buffer;
-        SequenceReader<byte> sequenceReader = new(buffer);
-        while (!sequenceReader.End)
-        {
-            while (sequenceReader.TryReadTo(out ReadOnlySpan<byte> line, newLine))
-            {
-                processLine(line);
-            }
-
-            buffer = buffer.Slice(sequenceReader.Position);
-            sequenceReader.Advance(buffer.Length);
-        }
-
-        reader.AdvanceTo(buffer.Start, buffer.End);
-        if (result.IsCompleted) break;
-    }
 }
