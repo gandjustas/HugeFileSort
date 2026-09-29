@@ -10,6 +10,9 @@ internal static class SortConstants
 {
     /// <summary>Порог необработанных байт для сброса PipeWriter в файл (Writer сам не пишет до FlushAsync).</summary>
     public const int FlushThreshold = 1024 * 1024;
+
+    /// <summary>Уровень zstd-компрессии промежуточных файлов.</summary>
+    public const int ZstdCompressionLevel = 3;
 }
 
 /// <summary>

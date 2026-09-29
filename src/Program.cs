@@ -1,4 +1,6 @@
-﻿using System.Buffers;
+using System.Buffers;
+using System.Diagnostics;
+using System.Globalization;
 using System.IO.Pipelines;
 using System.Text;
 using DotMake.CommandLine;
@@ -11,35 +13,29 @@ return await Cli.RunAsync<RootCliCommand>(args);
 internal partial class RootCliCommand
 {
     [CliCommand(Description = "Sort huge file: split into sorted chunks, then merge")]
-    internal partial class SortCliCommand
+    internal partial class SortCliCommand : HugeFileCommand
     {
-        [CliArgument(Description = "Source file to sort or check",
-            ValidationRules = CliValidationRules.ExistingFile)]
+        [CliArgument(Description = "Source file to sort", ValidationRules = CliValidationRules.ExistingFile)]
         public FileInfo Source { get; set; } = null!;
 
         [CliArgument(Description = "Destination file (will be overwritten)",
-            Arity = CliArgumentArity.ZeroOrOne,
-            ValidationRules = CliValidationRules.LegalPath)]
+            Arity = CliArgumentArity.ZeroOrOne, ValidationRules = CliValidationRules.LegalPath)]
         public FileInfo? Destination { get; set; }
 
-        [CliOption(Name = "encoding", Description = "Text encoding of the file (default: utf-8)")]
-        public string EncodingName { get; set; } = "utf-8";
+        [CliOption(Name = "parallel", Description = "Number of chunks sorted in parallel (default: 1)")]
+        public int Parallelism { get; set; } = 1;
 
         [CliOption(Name = "ordinal", Description = "Ordinal byte-wise comparison: skips sort key computation and sorts text bytes directly")]
         public bool Ordinal { get; set; }
 
-        public async Task<int> RunAsync(CliContext context)
-        {
-            if (!CliEncodings.TryGet(EncodingName, out var encoding))
-            {
-                Console.Error.WriteLine($"Unknown encoding: '{EncodingName}'");
-                return 1;
-            }
-            var ct = context.CancellationToken;
-            var sw = System.Diagnostics.Stopwatch.StartNew();
+        public Task<int> RunAsync(CliContext context) =>
+            RunWithEncodingAsync(SortAsync, context);
 
-            var compareOptions = Ordinal ? System.Globalization.CompareOptions.Ordinal : System.Globalization.CompareOptions.None;
-            var chunks = await new SplitSort<long>(Source, encoding, compareOptions).RunAsync(ct);
+        private async Task<int> SortAsync(Encoding encoding, CancellationToken ct)
+        {
+            var sw = Stopwatch.StartNew();
+            var compareOptions = Ordinal ? CompareOptions.Ordinal : CompareOptions.None;
+            var chunks = await new SplitSort<long>(Source, encoding, compareOptions, Parallelism).RunAsync(ct);
             foreach (var file in chunks)
                 Console.WriteLine(file.FullName);
             Console.WriteLine($"Chunks: {chunks.Count}");
@@ -64,88 +60,68 @@ internal partial class RootCliCommand
     }
 
     [CliCommand(Description = "Split a huge file into sorted chunk files, printing their paths to stdout")]
-    internal partial class SplitCliCommand
+    internal partial class SplitCliCommand : HugeFileCommand
     {
-        [CliArgument(Description = "Source file to split",
-            ValidationRules = CliValidationRules.ExistingFile)]
+        [CliArgument(Description = "Source file to split", ValidationRules = CliValidationRules.ExistingFile)]
         public FileInfo Source { get; set; } = null!;
 
-        [CliOption(Name = "encoding", Description = "Text encoding of the file (default: utf-8)")]
-        public string EncodingName { get; set; } = "utf-8";
+        [CliOption(Name = "parallel", Description = "Number of chunks sorted in parallel (default: 1)")]
+        public int Parallelism { get; set; } = 1;
 
         [CliOption(Name = "ordinal", Description = "Ordinal byte-wise comparison: skips sort key computation and sorts text bytes directly")]
         public bool Ordinal { get; set; }
 
-        public async Task<int> RunAsync(CliContext context)
+        public Task<int> RunAsync(CliContext context)
         {
-            if (!CliEncodings.TryGet(EncodingName, out var encoding))
+            var compareOptions = Ordinal ? CompareOptions.Ordinal : CompareOptions.None;
+            return RunWithEncodingAsync(async (encoding, ct) =>
             {
-                Console.Error.WriteLine($"Unknown encoding: '{EncodingName}'");
-                return 1;
-            }
-            var compareOptions = Ordinal ? System.Globalization.CompareOptions.Ordinal : System.Globalization.CompareOptions.None;
-            var chunks = await new SplitSort<long>(Source, encoding, compareOptions).RunAsync(context.CancellationToken);
-            foreach (var file in chunks)
-                Console.WriteLine(file.FullName);
-            return 0;
+                var chunks = await new SplitSort<long>(Source, encoding, compareOptions, Parallelism).RunAsync(ct);
+                foreach (var file in chunks)
+                    Console.WriteLine(file.FullName);
+                return 0;
+            }, context);
         }
     }
 
     [CliCommand(Description = "Merge sorted chunk files listed on stdin into one file")]
-    internal partial class MergeCliCommand
+    internal partial class MergeCliCommand : HugeFileCommand
     {
         [CliArgument(Description = "Destination file (will be overwritten)",
             ValidationRules = CliValidationRules.LegalPath)]
         public FileInfo Destination { get; set; } = null!;
 
-        [CliOption(Name = "encoding", Description = "Text encoding of the files (default: utf-8)")]
-        public string EncodingName { get; set; } = "utf-8";
+        public Task<int> RunAsync(CliContext context) =>
+            RunWithEncodingAsync(MergeAsync, context);
 
-        public async Task<int> RunAsync(CliContext context)
+        private async Task<int> MergeAsync(Encoding encoding, CancellationToken ct)
         {
-            if (!CliEncodings.TryGet(EncodingName, out var encoding))
-            {
-                Console.Error.WriteLine($"Unknown encoding: '{EncodingName}'");
-                return 1;
-            }
-            var chunks = new List<FileInfo>();
-            string? line;
-            while ((line = Console.ReadLine()) is not null)
+            List<FileInfo> chunks = [];
+            while (Console.ReadLine() is { } line)
             {
                 line = line.Trim();
-                if (line.Length == 0) continue;
-                chunks.Add(new FileInfo(line));
+                if (line.Length != 0)
+                    chunks.Add(new FileInfo(line));
             }
-            await new Merge<long>(Destination, encoding).RunAsync(chunks, context.CancellationToken);
+            await new Merge<long>(Destination, encoding).RunAsync(chunks, ct);
             return 0;
         }
     }
 
     [CliCommand(Description = "Check file is sorted")]
-    internal partial class CheckSortedCliCommand
+    internal partial class CheckSortedCliCommand : HugeFileCommand
     {
-        [CliArgument(Description = "Source file to sort or check",
-            ValidationRules = CliValidationRules.ExistingFile)]
+        [CliArgument(Description = "Source file to sort or check", ValidationRules = CliValidationRules.ExistingFile)]
         public FileInfo Source { get; set; } = null!;
 
-        [CliOption(Name = "encoding", Description = "Text encoding of the file (default: utf-8)")]
-        public string EncodingName { get; set; } = "utf-8";
+        public Task<int> RunAsync(CliContext context) =>
+            RunWithEncodingAsync(CheckAsync, context);
 
-        public async Task<int> RunAsync(CliContext context)
-        {
-            if (!CliEncodings.TryGet(EncodingName, out var encoding))
-            {
-                Console.Error.WriteLine($"Unknown encoding: '{EncodingName}'");
-                return 1;
-            }
-            return await Check(Source, encoding, context.CancellationToken);
-        }
-
-        private static async Task<int> Check(FileInfo source, Encoding encoding, CancellationToken ct)
+        private async Task<int> CheckAsync(Encoding encoding, CancellationToken ct)
         {
             var newLine = encoding.GetBytes(Environment.NewLine);
             var dotSpace = encoding.GetBytes(". ");
-            var reader = PipeReader.Create(source.OpenRead());
+            var reader = PipeReader.Create(Source.OpenRead());
 
             (string? s, long x) last = (null, 0L);
             var sorted = true;
@@ -174,7 +150,7 @@ internal partial class RootCliCommand
     }
 
     [CliCommand(Description = "Generate huge file")]
-    internal partial class GenerateCliCommand
+    internal partial class GenerateCliCommand : HugeFileCommand
     {
         [CliArgument(Description = "Destination file (will be overwritten)",
             ValidationRules = CliValidationRules.LegalPath)]
@@ -183,37 +159,26 @@ internal partial class RootCliCommand
         [CliArgument(Description = "Minimum size of file in MB", Required = true)]
         public int Size { get; set; }
 
-        [CliOption(Name = "encoding", Description = "Text encoding of the file (default: utf-8)")]
-        public string EncodingName { get; set; } = "utf-8";
+        public Task<int> RunAsync(CliContext context) =>
+            RunWithEncodingAsync(GenerateAsync, context);
 
-        public async Task<int> RunAsync(CliContext context)
-        {
-            if (!CliEncodings.TryGet(EncodingName, out var encoding))
-            {
-                Console.Error.WriteLine($"Unknown encoding: '{EncodingName}'");
-                return 1;
-            }
-            await Generate(Destination, encoding, Size, context.CancellationToken);
-            return 0;
-        }
-
-        private static async Task Generate(FileInfo file, Encoding encoding, int size, CancellationToken ct)
+        private async Task<int> GenerateAsync(Encoding encoding, CancellationToken ct)
         {
             var newLine = encoding.GetBytes(Environment.NewLine);
             var random = Random.Shared;
-            var buffer = new char[1024];
+            var textBuffer = new char[1024];
+            var numberBuffer = new char[16];
             long written = 0;
 
-            var writer = PipeWriter.Create(file.Create());
-            var number = new char[16];
-            while (written < size * 1024L * 1024L)
+            var writer = PipeWriter.Create(Destination.Create());
+            while (written < Size * 1024L * 1024L)
             {
-                random.Next().TryFormat(number, out var digits, "d");
-                encoding.GetBytes(number[..digits], writer);
+                random.Next().TryFormat(numberBuffer, out var digits, "d");
+                encoding.GetBytes(numberBuffer.AsSpan(0, digits), writer);
                 encoding.GetBytes(". ", writer);
-                encoding.GetBytes(RandomString(random, random.Next(buffer.Length), buffer), writer);
+                encoding.GetBytes(RandomString(random, random.Next(textBuffer.Length), textBuffer), writer);
                 writer.Write(newLine);
-                if (writer.UnflushedBytes > size)
+                if (writer.UnflushedBytes > Size)
                 {
                     written += writer.UnflushedBytes;
                     await writer.FlushAsync(ct);
@@ -221,24 +186,40 @@ internal partial class RootCliCommand
             }
 
             await writer.CompleteAsync();
+            return 0;
         }
 
         private static ReadOnlySpan<char> RandomString(Random random, int length, Span<char> span)
         {
             const string chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-            for (int i = 0; i < length; i++)
-            {
+            span = span[..length];
+            for (var i = 0; i < length; i++)
                 span[i] = chars[random.Next(chars.Length)];
-            }
-            return span[..length];
+            return span;
         }
     }
 }
 
-/// <summary>Разрешает имя кодировки из CLI (CodePages-провайдер даёт windows-125x и прочие).</summary>
-internal static class CliEncodings
+/// <summary>База команд, работающих с текстовыми файлами: общая опция кодировки и её разбор.</summary>
+internal abstract class HugeFileCommand
 {
-    public static bool TryGet(string name, out Encoding encoding)
+    [CliOption(Name = "encoding", Description = "Text encoding of the file (default: utf-8)")]
+    public string EncodingName { get; set; } = "utf-8";
+
+    protected Task<int> RunWithEncodingAsync(Func<Encoding, CancellationToken, Task<int>> run, CliContext context) =>
+        RunWithEncodingAsync(run, context.CancellationToken);
+
+    private async Task<int> RunWithEncodingAsync(Func<Encoding, CancellationToken, Task<int>> run, CancellationToken ct)
+    {
+        if (!TryGetEncoding(EncodingName, out var encoding))
+        {
+            Console.Error.WriteLine($"Unknown encoding: '{EncodingName}'");
+            return 1;
+        }
+        return await run(encoding, ct).ConfigureAwait(false);
+    }
+
+    private static bool TryGetEncoding(string name, out Encoding encoding)
     {
         try
         {

@@ -12,7 +12,11 @@ using ZstdSharp;
 /// Фаза разбиения: читает исходный файл, собирает строки в чанки (текст — ключ словаря, числа — списки),
 /// сортирует чанки параллельно (TPL Dataflow) и пишет отсортированные промежуточные файлы с компрессией zstd.
 /// </summary>
-class SplitSort<T> where T : IBinaryInteger<T>
+class SplitSort<T>(
+    FileInfo source,
+    Encoding encoding,
+    CompareOptions compareOptions,
+    int sortParallelism) where T : IBinaryInteger<T>
 {
     // Адаптивный размер чанка ограничен снизу (больше параллелизма на маленьких файлах)
     // и сверху (меньше накладных расходов merge на больших). Пул буферов округляет
@@ -26,41 +30,18 @@ class SplitSort<T> where T : IBinaryInteger<T>
     // Граница stackalloc для декодирующего char-буфера числа.
     private const int StackallocCharThreshold = 512;
 
-    // Порог необработанных байт для сброса PipeWriter в файл: StreamPipeWriter сам
-    // не пишет в Stream до FlushAsync/CompleteAsync.
-    private const int FlushThreshold = 1024 * 1024;
-
-    // zstd "быстрый" уровень компрессии промежуточных файлов.
-    private const int ZstdFastLevel = 1;
-
-    // Параллелизм сортировки чанков: чанк в сортировке держит буфер + sort keys (~3.5x Used)
-    // + словарь, поэтому верхняя граница ограничена памятью.
-    private static readonly int SortParallelism = Math.Min(Environment.ProcessorCount, 4);
-
-    readonly FileInfo source;
-    readonly Encoding encoding;
-    readonly byte[] newLine;
-    readonly byte[] dotSpace;
+    readonly FileInfo source = source;
+    readonly Encoding encoding = encoding;
+    readonly byte[] newLine = encoding.GetBytes(Environment.NewLine);
+    readonly byte[] dotSpace = encoding.GetBytes(". ");
     readonly CompareInfo compareInfo = CultureInfo.CurrentCulture.CompareInfo;
-    readonly CompareOptions compareOptions;
-    readonly bool isUtf8;
-    readonly bool isOrdinal;
-    readonly int bufferSize;
+    readonly CompareOptions compareOptions = compareOptions;
+    readonly bool isUtf8 = encoding.WebName == "utf-8";
+    readonly bool isOrdinal = compareOptions == CompareOptions.Ordinal;
+    readonly int bufferSize = ComputeBufferSize(source.Length);
     readonly ArrayPool<byte> arrayPool = ArrayPool<byte>.Shared;
     readonly ObjectPool<List<T>> listPool = new DefaultObjectPool<List<T>>(new ListPoolPolicy<T>());
     readonly ObjectPool<Dictionary<ArraySegment<byte>, List<T>>> dictionaryPool = new DefaultObjectPool<Dictionary<ArraySegment<byte>, List<T>>>(new LookupPoolPolicy<T>());
-
-    public SplitSort(FileInfo source, Encoding encoding, CompareOptions compareOptions = CompareOptions.None)
-    {
-        this.source = source;
-        this.encoding = encoding;
-        this.compareOptions = compareOptions;
-        isUtf8 = encoding.WebName == "utf-8";
-        isOrdinal = compareOptions == CompareOptions.Ordinal;
-        newLine = encoding.GetBytes(Environment.NewLine);
-        dotSpace = encoding.GetBytes(". ");
-        bufferSize = ComputeBufferSize(source.Length);
-    }
 
     /// <summary>Адаптивный буфер чанка: большой файл — крупные чанки (меньше накладных расходов merge), маленький — мелкие (больше параллелизма).</summary>
     private static int ComputeBufferSize(long fileLength) =>
@@ -81,8 +62,9 @@ class SplitSort<T> where T : IBinaryInteger<T>
             },
             new ExecutionDataflowBlockOptions
             {
-                MaxDegreeOfParallelism = SortParallelism,
-                BoundedCapacity = SortParallelism * 2,
+                MaxDegreeOfParallelism = sortParallelism,
+                BoundedCapacity = sortParallelism * 2,
+                EnsureOrdered = false,
                 CancellationToken = ct,
             });
         var saver = new TransformBlock<Chunk<T>, FileInfo>(
@@ -96,9 +78,14 @@ class SplitSort<T> where T : IBinaryInteger<T>
             {
                 MaxDegreeOfParallelism = 2,
                 BoundedCapacity = 4,
+                EnsureOrdered = false,
                 CancellationToken = ct,
             });
-        var fileNames = new BufferBlock<FileInfo>(new DataflowBlockOptions { CancellationToken = ct });
+        var fileNames = new BufferBlock<FileInfo>(new DataflowBlockOptions
+        {
+            EnsureOrdered = false,
+            CancellationToken = ct,
+        });
         var sorterToSaver = sorter.LinkTo(saver, new DataflowLinkOptions { PropagateCompletion = true });
         var saverToNames = saver.LinkTo(fileNames, new DataflowLinkOptions { PropagateCompletion = true });
 
@@ -135,7 +122,7 @@ class SplitSort<T> where T : IBinaryInteger<T>
         if (loopError is not null)
             throw new InvalidOperationException("Failed to split the source file", loopError);
 
-        var files = new List<FileInfo>();
+        List<FileInfo> files = [];
         while (fileNames.TryReceive(out var file))
             files.Add(file);
         return files;
@@ -275,7 +262,7 @@ class SplitSort<T> where T : IBinaryInteger<T>
         var index = Interlocked.Increment(ref savedChunkCount) - 1;
         var chunkFile = new FileInfo(Path.ChangeExtension(source.FullName, $".chunk-{index:D3}{Path.GetExtension(source.FullName)}"));
         await using var fileStream = chunkFile.Create();
-        await using var zstdStream = new CompressionStream(fileStream, ZstdFastLevel);
+        await using var zstdStream = new CompressionStream(fileStream, SortConstants.ZstdCompressionLevel);
         var writer = PipeWriter.Create(zstdStream);
         foreach (var entry in chunk.Sorted!)
         {
@@ -291,7 +278,7 @@ class SplitSort<T> where T : IBinaryInteger<T>
                 writer.WriteVarint(ulong.CreateChecked(value - previous));
                 previous = value;
             }
-            if (writer.UnflushedBytes >= FlushThreshold)
+            if (writer.UnflushedBytes >= SortConstants.FlushThreshold)
                 await writer.FlushAsync(ct).ConfigureAwait(false);
         }
         await writer.FlushAsync(ct).ConfigureAwait(false);
