@@ -114,11 +114,15 @@ internal partial class RootCliCommand
         [CliArgument(Description = "Source file to sort or check", ValidationRules = CliValidationRules.ExistingFile)]
         public FileInfo Source { get; set; } = null!;
 
+        [CliOption(Name = "ordinal", Description = "Ordinal byte-wise comparison (matches sort --ordinal)")]
+        public bool Ordinal { get; set; }
+
         public Task<int> RunAsync(CliContext context) =>
             RunWithEncodingAsync(CheckAsync, context);
 
         private async Task<int> CheckAsync(Encoding encoding, CancellationToken ct)
         {
+            var comparison = Ordinal ? StringComparison.Ordinal : StringComparison.CurrentCulture;
             var newLine = encoding.GetBytes(Environment.NewLine);
             var dotSpace = encoding.GetBytes(". ");
             var reader = PipeReader.Create(Source.OpenRead());
@@ -132,7 +136,7 @@ internal partial class RootCliCommand
                     throw new FormatException("Line does not contain '. ' delimiter");
                 var x = DecodeNumber(line[..dotPos], encoding);
                 var s = encoding.GetString(line[(dotPos + dotSpace.Length)..]);
-                var cmp = s.CompareTo(last.s);
+                var cmp = string.Compare(s, last.s, comparison);
                 sorted = sorted && cmp >= 0 && (cmp > 0 || x >= last.x);
                 last = (s, x);
             }, ct);
