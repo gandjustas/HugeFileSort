@@ -4,18 +4,18 @@ using System.IO.Pipelines;
 using System.Numerics;
 using System.Runtime.CompilerServices;
 using System.Text;
+using ZstdSharp;
 
 /// <summary>
 /// Фаза слияния: мержит отсортированные промежуточные файлы в один итоговый.
+/// Sort key уже вычислены при split и сохранены в чанках — слияние только сравнивает их как байты.
 /// </summary>
-class Merge<T>(FileInfo destination, Encoding encoding, CompareOptions compareOptions = CompareOptions.None) where T : IBinaryInteger<T>
+class Merge<T>(FileInfo destination, Encoding encoding) where T : IBinaryInteger<T>
 {
     readonly FileInfo destination = destination;
     readonly Encoding encoding = encoding;
     readonly byte[] newLine = encoding.GetBytes(Environment.NewLine);
     readonly byte[] dotSpace = encoding.GetBytes(". ");
-    readonly CompareInfo compareInfo = CultureInfo.CurrentCulture.CompareInfo;
-    readonly CompareOptions compareOptions = compareOptions;
 
 
     /// <summary>
@@ -26,8 +26,8 @@ class Merge<T>(FileInfo destination, Encoding encoding, CompareOptions compareOp
     {
         var sw = System.Diagnostics.Stopwatch.StartNew();
         var writer = PipeWriter.Create(destination.Create());
-        var sources = chunkFiles.Select(c => PipeReader.Create(c.OpenRead())
-            .ReadChunkEntries<T>(encoding, compareInfo, compareOptions, ct));
+        var sources = chunkFiles.Select(c => new DecompressionStream(c.OpenRead(), leaveOpen: false)
+            .ReadChunkEntries<T>(ct));
 
         var number = new char[32];
         await foreach (var group in sources.MergeSorted(ChunkEntryComparer<T>.Instance, MergeGroup, ct).WithCancellation(ct).ConfigureAwait(false))

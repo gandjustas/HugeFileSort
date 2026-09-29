@@ -12,5 +12,6 @@
     </PackageVersion>
     <PackageVersion Include="DotMake.CommandLine" Version="3.7.0" />
     <PackageVersion Include="System.IO.Hashing" Version="10.0.3" />
+    <PackageVersion Include="ZstdSharp.Port" Version="0.8.8" />
   </ItemGroup>
 </Project>

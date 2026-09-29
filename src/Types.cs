@@ -65,8 +65,11 @@ sealed class SortKeyComparer : IComparer<ArraySegment<byte>>
         x.AsSpan().SequenceCompareTo(y.AsSpan());
 }
 
-/// <summary>Запись чанка: ключ (байты текста в буфере чанка) и его числа.</summary>
-readonly record struct ChunkEntry<T>(ArraySegment<byte> Key, List<T> Values);
+/// <summary>
+/// Запись чанка: ключ (байты текста в буфере чанка), его sort key (байтовый сегмент в общем массиве чанка;
+/// default при ordinal-режиме — ключом служат сами байты текста) и числа.
+/// </summary>
+readonly record struct ChunkEntry<T>(ArraySegment<byte> Key, ArraySegment<byte> SortKey, List<T> Values);
 
 /// <summary>
 /// Запись промежуточного файла при чтении: текст и sort key — сегменты арендованных из ArrayPool массивов,
@@ -96,7 +99,9 @@ sealed class ReadChunkEntry<T> : IDisposable where T : IBinaryInteger<T>
     public void Dispose()
     {
         ArrayPool<byte>.Shared.Return(Text.Array!);
-        ArrayPool<byte>.Shared.Return(SortKey.Array!);
+        // В ordinal-режиме SortKey указывает на тот же массив, что и Text, — вернуть один раз.
+        if (!ReferenceEquals(SortKey.Array, Text.Array))
+            ArrayPool<byte>.Shared.Return(SortKey.Array!);
         listPool.Return(Values);
     }
 }

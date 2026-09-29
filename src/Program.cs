@@ -25,6 +25,9 @@ internal partial class RootCliCommand
         [CliOption(Name = "encoding", Description = "Text encoding of the file (default: utf-8)")]
         public string EncodingName { get; set; } = "utf-8";
 
+        [CliOption(Name = "ordinal", Description = "Ordinal byte-wise comparison: skips sort key computation and sorts text bytes directly")]
+        public bool Ordinal { get; set; }
+
         public async Task<int> RunAsync(CliContext context)
         {
             if (!CliEncodings.TryGet(EncodingName, out var encoding))
@@ -35,7 +38,8 @@ internal partial class RootCliCommand
             var ct = context.CancellationToken;
             var sw = System.Diagnostics.Stopwatch.StartNew();
 
-            var chunks = await new SplitSort<long>(Source, encoding).RunAsync(ct);
+            var compareOptions = Ordinal ? System.Globalization.CompareOptions.Ordinal : System.Globalization.CompareOptions.None;
+            var chunks = await new SplitSort<long>(Source, encoding, compareOptions).RunAsync(ct);
             foreach (var file in chunks)
                 Console.WriteLine(file.FullName);
             Console.WriteLine($"Chunks: {chunks.Count}");
@@ -50,9 +54,9 @@ internal partial class RootCliCommand
                 {
                     file.Delete();
                 }
-                catch
+                catch (Exception ex)
                 {
-                    // Пропускаем ошибки, чтобы удалить как можно больше чанков
+                    Console.Error.WriteLine($"Delete failed: {file.FullName}: {ex.Message}");
                 }
             }
             return 0;
@@ -69,6 +73,9 @@ internal partial class RootCliCommand
         [CliOption(Name = "encoding", Description = "Text encoding of the file (default: utf-8)")]
         public string EncodingName { get; set; } = "utf-8";
 
+        [CliOption(Name = "ordinal", Description = "Ordinal byte-wise comparison: skips sort key computation and sorts text bytes directly")]
+        public bool Ordinal { get; set; }
+
         public async Task<int> RunAsync(CliContext context)
         {
             if (!CliEncodings.TryGet(EncodingName, out var encoding))
@@ -76,7 +83,8 @@ internal partial class RootCliCommand
                 Console.Error.WriteLine($"Unknown encoding: '{EncodingName}'");
                 return 1;
             }
-            var chunks = await new SplitSort<long>(Source, encoding).RunAsync(context.CancellationToken);
+            var compareOptions = Ordinal ? System.Globalization.CompareOptions.Ordinal : System.Globalization.CompareOptions.None;
+            var chunks = await new SplitSort<long>(Source, encoding, compareOptions).RunAsync(context.CancellationToken);
             foreach (var file in chunks)
                 Console.WriteLine(file.FullName);
             return 0;
