@@ -9,6 +9,9 @@ using Microsoft.Extensions.ObjectPool;
 /// <summary>Ключ чанка: смещение и длина байт текста в нативном буфере чанка.</summary>
 readonly record struct BufferString(int Offset, int Length);
 
+/// <summary>Значение словаря чанка: последовательный номер ключа и количество значений у ключа.</summary>
+readonly record struct KeyInfo(int Number, int Count);
+
 /// <summary>
 /// Сравнитель ключей Dictionary чанка: при добавлении нового ключа копирует альтернативу (байты текста)
 /// в привязанный нативный буфер и возвращает BufferString — ключи не аллоцируют отдельные массивы.
@@ -73,9 +76,6 @@ sealed unsafe class NativeSegmentComparer(byte* buffer) : IComparer<BufferString
     }
 }
 
-/// <summary>Запись чанка: ключ и sort key (BufferString в нативных буферах чанка) и его числа.</summary>
-readonly record struct ChunkEntry<T>(BufferString Key, BufferString SortKey, List<T> Values);
-
 /// <summary>
 /// Запись промежуточного файла при чтении: текст и sort key — сегменты арендованных из ArrayPool массивов,
 /// значения — список из ObjectPool. Владелец обязан вызвать Dispose, когда запись больше не нужна
@@ -137,11 +137,11 @@ sealed class ListPoolPolicy<T> : IPooledObjectPolicy<List<T>>
 }
 
 /// <summary>Политика пула словарей чанка: каждый словарь создаётся со своим BytesComparer.</summary>
-sealed class LookupPoolPolicy<T> : IPooledObjectPolicy<Dictionary<BufferString, List<T>>>
+sealed class LookupPoolPolicy : IPooledObjectPolicy<Dictionary<BufferString, KeyInfo>>
 {
-    public Dictionary<BufferString, List<T>> Create() => new(new BytesComparer());
+    public Dictionary<BufferString, KeyInfo> Create() => new(new BytesComparer());
 
-    public bool Return(Dictionary<BufferString, List<T>> obj)
+    public bool Return(Dictionary<BufferString, KeyInfo> obj)
     {
         obj.Clear();
         return true;
@@ -149,36 +149,24 @@ sealed class LookupPoolPolicy<T> : IPooledObjectPolicy<Dictionary<BufferString, 
 }
 
 /// <summary>
-/// Чанк: нативный буфер, на который ссылаются ключи Dictionary через BufferString, сам Dictionary
-/// (байты текста → список чисел), нативный буфер sort key и ссылки на пулы; Dispose освобождает всё.
+/// Чанк: фаза разбиения — нативный буфер текстов (ключи Dictionary ссылаются через BufferString),
+/// словарь (байты текста → номер ключа + количество значений) и один список пар (номер, значение);
+/// после finalize — нативный буфер sort key, CSR-массив значений и порядок записи.
+/// Dispose освобождает нативную память, массивы — GC.
 /// </summary>
-sealed unsafe class Chunk<T> : IDisposable where T : INumber<T>
+sealed unsafe class Chunk<T> : IDisposable where T : IBinaryInteger<T>
 {
     private readonly byte* buffer;
     private readonly int bufferLength;
-    private readonly ObjectPool<List<T>> listPool;
-    private readonly ObjectPool<Dictionary<BufferString, List<T>>> dictionaryPool;
-    // Один dictionaryPool.Get() на все три поля: comparer и alternate lookup обязаны
-    // принадлежать тому же словарю, что и lookup.
-    private readonly Dictionary<BufferString, List<T>> lookup = null!;
-    private readonly BytesComparer comparer = null!;
-    private readonly Dictionary<BufferString, List<T>>.AlternateLookup<ReadOnlySpan<byte>> alt;
-
-    private byte* sortKeyBuffer;
-    public int Id { get; set; }
-    private int sortKeyLength;
-    private bool lookupReleased;
-    private List<List<T>>? valueLists;
+    private readonly ObjectPool<Dictionary<BufferString, KeyInfo>> dictionaryPool;
 
     public Chunk(
-        ObjectPool<List<T>> listPool,
-        ObjectPool<Dictionary<BufferString, List<T>>> dictionaryPool,
+        ObjectPool<Dictionary<BufferString, KeyInfo>> dictionaryPool,
         int bufferSize)
     {
+        this.dictionaryPool = dictionaryPool;
         buffer = (byte*)NativeMemory.AlignedAlloc((nuint)bufferSize, 64);
         bufferLength = bufferSize;
-        this.listPool = listPool;
-        this.dictionaryPool = dictionaryPool;
         // Один dictionaryPool.Get() на все три поля: comparer и alternate lookup обязаны
         // принадлежать тому же словарю, что и lookup.
         lookup = dictionaryPool.Get();
@@ -186,82 +174,129 @@ sealed unsafe class Chunk<T> : IDisposable where T : INumber<T>
         comparer.Bind(buffer, bufferLength);
         alt = lookup.GetAlternateLookup<ReadOnlySpan<byte>>();
     }
+    // Один dictionaryPool.Get() на все три поля: comparer и alternate lookup обязаны
+    // принадлежать тому же словарю, что и lookup.
+    private readonly Dictionary<BufferString, KeyInfo> lookup;
+    private readonly BytesComparer comparer;
+    private readonly Dictionary<BufferString, KeyInfo>.AlternateLookup<ReadOnlySpan<byte>> alt;
 
-    /// <summary>Нативный буфер ключей чанка.</summary>
+    private readonly List<(int Number, T Value)> pairs = [];
+    private readonly List<int> textLengths = [];
+
+    private byte* sortKeyBuffer;
+    private int sortKeyLength;
+    private bool lookupReleased;
+
+    /// <summary>Нативный буфер текстов ключей (лежат подряд в порядке номеров).</summary>
     public Span<byte> BufferSpan => new(buffer, bufferLength);
 
-    public Dictionary<BufferString, List<T>> Lookup => lookup;
+    public Dictionary<BufferString, KeyInfo> Lookup => lookup;
 
     /// <summary>Компарер ключей, привязанный к буферу чанка (используется и для ordinal-сортировки).</summary>
     public BytesComparer Comparer => comparer;
 
-    /// <summary>Указатель на нативный буфер sort key.</summary>
-    public byte* SortKeyPtr => sortKeyBuffer;
-
-    /// <summary>Текущая ёмкость буфера sort key.</summary>
-    public int SortKeyLength => sortKeyLength;
-
     /// <summary>Ключи, упорядоченные по строковому сравнению; заполняется фазой сортировки.</summary>
-    public List<ChunkEntry<T>>? Sorted { get; set; }
+    public int[]? Order { get; internal set; }
 
     /// <summary>Байт занято под ключи в буфере чанка.</summary>
     public int Used => comparer.Offset;
 
-    public void Dispose()
+    /// <summary>CSR-массив значений после finalize.</summary>
+    public T[]? Values { get; internal set; }
+
+    /// <summary>Границы диапазонов значений по номерам ключей (длина K+1).</summary>
+    public int[]? CsrOffsets { get; internal set; }
+
+    /// <summary>Длины sort key по номерам ключей.</summary>
+    public int[]? SortKeyLengths { get; internal set; }
+
+    /// <summary>Смещения sort key по номерам ключей.</summary>
+    public int[]? SortKeyOffsets { get; internal set; }
+
+    /// <summary>Смещения текстов по номерам ключей.</summary>
+    public int[]? TextOffsets { get; internal set; }
+
+    /// <summary>Длины текстов ключей по номерам.</summary>
+    public IReadOnlyList<int> TextLengths => textLengths;
+
+    /// <summary>Число уникальных ключей в чанке.</summary>
+    public int KeyCount => lookup.Count;
+
+    /// <summary>
+    /// Строит CSR-массив значений: границы по номерам ключей (префикс-сумма количеств)
+    /// и scatter пар в свои диапазоны.
+    /// </summary>
+    public T[] BuildCsr()
     {
-        ReleaseLookup();
-        ReleaseSortKeys();
-        // Списки значений нужны до конца записи чанка — возвращаем только здесь.
-        if (valueLists is not null)
-        {
-            foreach (var list in valueLists)
-            {
-                list.Clear();
-                listPool.Return(list);
-            }
-            valueLists = null;
-        }
-        Sorted = null;
+        var k = textLengths.Count;
+        var csr = new int[k + 1];
+        foreach (var (number, _) in pairs)
+            csr[number + 1]++;
+        for (var i = 1; i <= k; i++)
+            csr[i] += csr[i - 1];
+        var values = GC.AllocateUninitializedArray<T>(pairs.Count);
+        var fill = new int[k];
+        foreach (var (number, value) in pairs)
+            values[csr[number] + fill[number]++] = value;
+        Values = values;
+        CsrOffsets = csr;
+        return values;
     }
 
-    /// <summary>Возвращает словарь в пул до завершения жизни чанка (после сортировки словарь не нужен —
-    /// остаются только буфер с ключами, Sorted и списки значений до конца записи).</summary>
+    /// <summary>Срез нативного буфера текстов.</summary>
+    public unsafe Span<byte> GetTextSlice(int offset, int length) => new(buffer + offset, length);
+
+    /// <summary>Срез нативного буфера sort key.</summary>
+    public unsafe Span<byte> GetSortKeySlice(int offset, int length) => new(sortKeyBuffer + offset, length);
+
+    /// <summary>Компарер sort key, привязанный к текущему нативному буферу sort key.</summary>
+    public unsafe NativeSegmentComparer CreateSortKeyComparer() => new(sortKeyBuffer);
+
+    /// <summary>Выделяет нативный буфер sort key точного размера.</summary>
+    public unsafe void AllocateSortKeys(int totalLength)
+    {
+        sortKeyBuffer = (byte*)NativeMemory.AlignedAlloc((nuint)Math.Max(16, totalLength), 64);
+        sortKeyLength = totalLength;
+    }
+
+    public unsafe Span<byte> SortKeySpan => new(sortKeyBuffer, sortKeyLength);
+
+    public unsafe Span<byte> SortKeySpanFrom(int offset) => new(sortKeyBuffer + offset, sortKeyLength - offset);
+
+    /// <summary>
+    /// Добавляет строку: текст (уже скопирован в буфер чанка) и значение.
+    /// Новый текст получает очередной номер; пара (номер, значение) — в общий список.
+    /// </summary>
+    public void Add(ReadOnlySpan<byte> text, T value)
+    {
+        ref var info = ref CollectionsMarshal.GetValueRefOrAddDefault(alt, text, out var exist);
+        if (!exist)
+        {
+            info = new KeyInfo(textLengths.Count, 1);
+            textLengths.Add(text.Length);
+        }
+        else
+        {
+            info = info with { Count = info.Count + 1 };
+        }
+        pairs.Add((info.Number, value));
+    }
+
+    /// <summary>Возвращает словарь в пул до завершения жизни чанка (после finalize словарь не нужен).</summary>
     public void ReleaseLookup()
     {
         if (lookupReleased)
             return;
         lookupReleased = true;
-        valueLists = [.. lookup.Values];
         dictionaryPool.Return(lookup);
     }
 
-    /// <summary>Выделяет нативный буфер под sort keys чанка.</summary>
-    public void AllocateSortKeys(int length)
+    public void Dispose()
     {
-        sortKeyBuffer = (byte*)NativeMemory.AlignedAlloc((nuint)Math.Max(16, length), 64);
-        sortKeyLength = (int)Math.Max(16, length);
+        ReleaseLookup();
+        ReleaseSortKeys();
+        NativeMemory.AlignedFree(buffer);
     }
-
-    /// <summary>Перевыделает буфер sort key вдвое большим; сегменты уже записанных ключей
-    /// становятся невалидны — вызывающий обязан перезаписать ключи заново.</summary>
-    public void GrowSortKeys()
-    {
-        var old = sortKeyBuffer;
-        sortKeyLength *= 2;
-        sortKeyBuffer = (byte*)NativeMemory.AlignedAlloc((nuint)sortKeyLength, 64);
-        if (old is not null)
-            NativeMemory.AlignedFree(old);
-    }
-
-    public Span<byte> SortKeySpan => new(sortKeyBuffer, sortKeyLength);
-
-    public Span<byte> SortKeySpanFrom(int offset) => new(sortKeyBuffer + offset, sortKeyLength - offset);
-
-    /// <summary>Компарер sort key, привязанный к текущему нативному буферу чанка.</summary>
-    public unsafe NativeSegmentComparer CreateSortKeyComparer() => new(sortKeyBuffer);
-
-    /// <summary>Срез нативного буфера sort key.</summary>
-    public unsafe Span<byte> GetSortKeySlice(int offset, int length) => new(sortKeyBuffer + offset, length);
 
     /// <summary>Освобождает нативный буфер sort key после записи чанка.</summary>
     public void ReleaseSortKeys()
@@ -270,15 +305,5 @@ sealed unsafe class Chunk<T> : IDisposable where T : INumber<T>
             return;
         NativeMemory.AlignedFree(sortKeyBuffer);
         sortKeyBuffer = null;
-    }
-
-    internal void AddItemToLookup(ReadOnlySpan<byte> key, T x)
-    {
-        ref var list = ref CollectionsMarshal.GetValueRefOrAddDefault(alt, key, out var exist);
-        if (!exist)
-        {
-            list = listPool.Get();
-        }
-        list!.Add(x);
     }
 }
