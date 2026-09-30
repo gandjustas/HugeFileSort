@@ -10,13 +10,16 @@ using ZstdSharp;
 /// Фаза слияния: мержит отсортированные промежуточные файлы в один итоговый.
 /// Sort key уже вычислены при split и сохранены в чанках — слияние только сравнивает их как байты.
 /// </summary>
-class Merge<T>(FileInfo destination, Encoding encoding, int flushMb) where T : IBinaryInteger<T>
+class Merge<T>(FileInfo destination, Encoding encoding, int flushMb, long? preallocatedLength = null) where T : IBinaryInteger<T>
 {
     readonly FileInfo destination = destination;
     readonly Encoding encoding = encoding;
     readonly byte[] newLine = encoding.GetBytes(Environment.NewLine);
     readonly byte[] dotSpace = encoding.GetBytes(". ");
     readonly int flushThreshold = flushMb * 1024 * 1024;
+    readonly long? preallocatedLength = preallocatedLength;
+    // Буфер файлового потока записи — чуть меньше порога сброса PipeWriter.
+    readonly int writeStreamBufferSize = Math.Clamp(flushMb * 1024 * 1024 - 64 * 1024, 64 * 1024, 1024 * 1024);
 
 
     /// <summary>
@@ -26,7 +29,12 @@ class Merge<T>(FileInfo destination, Encoding encoding, int flushMb) where T : I
     public async Task RunAsync(IReadOnlyList<FileInfo> chunkFiles, CancellationToken ct)
     {
         var sw = System.Diagnostics.Stopwatch.StartNew();
-        var writer = PipeWriter.Create(destination.Create());
+        await using var fileStream = new FileStream(destination.FullName, FileMode.Create, FileAccess.Write, FileShare.None,
+            bufferSize: writeStreamBufferSize, FileOptions.SequentialScan);
+        if (preallocatedLength is { } size)
+            fileStream.SetLength(size);
+        fileStream.Seek(0, SeekOrigin.Begin);
+        var writer = PipeWriter.Create(fileStream, new StreamPipeWriterOptions(leaveOpen: true));
         var sources = chunkFiles.Select(c => new DecompressionStream(c.OpenRead(), leaveOpen: false)
             .ReadChunkEntries<T>(ct));
 
@@ -47,6 +55,8 @@ class Merge<T>(FileInfo destination, Encoding encoding, int flushMb) where T : I
         }
         await writer.FlushAsync(ct).ConfigureAwait(false);
         await writer.CompleteAsync().ConfigureAwait(false);
+        if (preallocatedLength is not null)
+            fileStream.SetLength(fileStream.Position);
         Console.WriteLine($"Merged: {destination.FullName}");
         Console.WriteLine(sw.Elapsed);
     }

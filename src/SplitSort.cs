@@ -38,6 +38,9 @@ class SplitSort<T>(
     readonly bool isOrdinal = compareOptions == CompareOptions.Ordinal;
     readonly int bufferSize = ComputeBufferSize(source.Length, minChunkMb, maxChunkMb);
     readonly int flushThreshold = flushMb * 1024 * 1024;
+    // Буфер файлового потока записи — чуть меньше порога сброса PipeWriter,
+    // чтобы данные уходили в файл сквозь двойную буферизацию большими блоками.
+    readonly int writeStreamBufferSize = Math.Clamp(flushMb * 1024 * 1024 - 64 * 1024, 64 * 1024, 1024 * 1024);
     readonly int zstdLevel = zstdLevel;
     readonly ArrayPool<byte> arrayPool = ArrayPool<byte>.Shared;
     readonly ObjectPool<Dictionary<BufferString, KeyInfo>> dictionaryPool = new DefaultObjectPool<Dictionary<BufferString, KeyInfo>>(new LookupPoolPolicy());
@@ -82,11 +85,22 @@ class SplitSort<T>(
         var sorterToSaver = sorter.LinkTo(saver, new DataflowLinkOptions { PropagateCompletion = true });
         var saverToNames = saver.LinkTo(fileNames, new DataflowLinkOptions { PropagateCompletion = true });
 
-        var reader = PipeReader.Create(source.OpenRead());
+        // Чтение файла выделенным продюсером через Pipe: FileStream без внутренней буферизации
+        // и с SequentialScan, большие пороги позволяют читателю уходить вперёд на 8-16 МБ.
+        var pipe = new Pipe(new PipeOptions(
+            minimumSegmentSize: 1 << 20,
+            pauseWriterThreshold: 16 << 20,
+            resumeWriterThreshold: 8 << 20,
+            useSynchronizationContext: false));
+
+        using var fileStream = new FileStream(source.FullName, FileMode.Open, FileAccess.Read, FileShare.Read,
+            bufferSize: 0, FileOptions.SequentialScan | FileOptions.Asynchronous);
+        var fill = FillAsync(fileStream, pipe.Writer, readSize: 1 << 20);
+
         Exception? loopError = null;
         try
         {
-            await foreach (var chunk in SplitToChunks(reader.Split(newLine, ct), bufferSize, ct).ConfigureAwait(false))
+            await foreach (var chunk in SplitToChunks(pipe.Reader.Split(newLine, ct), bufferSize, ct).ConfigureAwait(false))
             {
                 await sorter.SendAsync(chunk, ct).ConfigureAwait(false);
             }
@@ -108,6 +122,16 @@ class SplitSort<T>(
             saverToNames.Dispose();
         }
 
+        try
+        {
+            await fill.ConfigureAwait(false);
+        }
+        catch (Exception ex) when (loopError is not null)
+        {
+            // Первая ошибка — из цикла разбора; исключение fill теряется намеренно
+            _ = ex;
+        }
+
         if (loopError is not null)
             throw new InvalidOperationException("Failed to split the source file", loopError);
 
@@ -115,6 +139,28 @@ class SplitSort<T>(
         while (fileNames.TryReceive(out var file))
             files.Add(file);
         return files;
+    }
+
+    /// <summary>Продюсер чтения файла: блоками readSize в пайп.</summary>
+    private static async Task FillAsync(Stream source, PipeWriter writer, int readSize)
+    {
+        try
+        {
+            while (true)
+            {
+                var mem = writer.GetMemory(readSize);
+                int n = await source.ReadAsync(mem).ConfigureAwait(false);
+                if (n == 0) break;
+                writer.Advance(n);
+                var r = await writer.FlushAsync().ConfigureAwait(false);
+                if (r.IsCompleted) break;
+            }
+            await writer.CompleteAsync().ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            await writer.CompleteAsync(ex).ConfigureAwait(false);
+        }
     }
 
     /// <summary>
@@ -278,9 +324,13 @@ class SplitSort<T>(
     {
         var index = Interlocked.Increment(ref savedChunkCount) - 1;
         var chunkFile = new FileInfo(Path.ChangeExtension(source.FullName, $".chunk-{index:D3}{Path.GetExtension(source.FullName)}"));
-        await using var fileStream = chunkFile.Create();
-        await using var zstdStream = new CompressionStream(fileStream, zstdLevel);
-        var writer = PipeWriter.Create(zstdStream);
+        using var fileStream = new FileStream(chunkFile.FullName, FileMode.Create, FileAccess.Write, FileShare.None,
+            bufferSize: writeStreamBufferSize, FileOptions.SequentialScan);
+        // Преаллокация точного несжатого размера — файловая система не расширяет файл по кусочкам.
+        fileStream.SetLength(ComputeChunkSize(chunk));
+        fileStream.Seek(0, SeekOrigin.Begin);
+        using var zstdStream = new CompressionStream(fileStream, zstdLevel);
+        var writer = PipeWriter.Create(zstdStream, new StreamPipeWriterOptions(leaveOpen: true));
         var textOffsets = chunk.TextOffsets!;
         var sortKeyOffsets = chunk.SortKeyOffsets;
         var sortKeyLengths = chunk.SortKeyLengths;
@@ -310,8 +360,42 @@ class SplitSort<T>(
         await writer.FlushAsync(ct).ConfigureAwait(false);
         await writer.CompleteAsync().ConfigureAwait(false);
         chunk.ReleaseSortKeys();
-        // Dispose zstd-потока дописывает footer кадра; await using закрывает его и файл.
+        // Dispose zstd-потока дописывает footer кадра; затем обрезаем преаллокацию по факту.
+        zstdStream.Dispose();
+        fileStream.SetLength(fileStream.Position);
         return chunkFile;
     }
     private int savedChunkCount;
+
+    /// <summary>Точный несжатый размер файла чанка до записи — для преаллокации.</summary>
+    private static long ComputeChunkSize(Chunk<T> chunk)
+    {
+        var textOffsets = chunk.TextOffsets!;
+        var sortKeyOffsets = chunk.SortKeyOffsets; // null в ordinal-режиме
+        var sortKeyLengths = chunk.SortKeyLengths;
+        var csr = chunk.CsrOffsets!;
+        var values = chunk.Values!;
+        long total = 0;
+        foreach (var i in chunk.Order!)
+        {
+            var textLen = textOffsets[i + 1] - textOffsets[i];
+            var count = csr[i + 1] - csr[i];
+            total += VarintSize((ulong)textLen) + textLen + VarintSize((ulong)count);
+            if (sortKeyLengths is not null)
+            {
+                var keyLen = sortKeyLengths[i];
+                total += VarintSize((ulong)keyLen) + keyLen;
+            }
+            T previous = T.Zero;
+            for (var j = csr[i]; j < csr[i + 1]; j++)
+            {
+                var delta = ulong.CreateChecked(values[j] - previous);
+                total += VarintSize(delta);
+                previous = values[j];
+            }
+        }
+        return total;
+    }
+
+    private static int VarintSize(ulong value) => 1 + (int)(BitOperations.Log2(value | 1) / 7);
 }

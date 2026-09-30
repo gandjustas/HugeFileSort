@@ -41,8 +41,8 @@ internal partial class RootCliCommand
         [CliOption(Name = "flush-mb", Description = "Unflushed bytes threshold for the output writer, MB (default: 1)")]
         public int FlushMb { get; set; } = 1;
 
-        [CliOption(Name = "zstd-level", Description = "Zstd compression level for chunk files (default: 9)")]
-        public int ZstdLevel { get; set; } = 9;
+        [CliOption(Name = "zstd-level", Description = "Zstd compression level for chunk files (default: 6)")]
+        public int ZstdLevel { get; set; } = 6;
 
         public Task<int> RunAsync(CliContext context) =>
             RootCliCommand.RunWithSettingsAsync(CompareOptionsName, (encoding, compareOptions, ct) => SortAsync(encoding, compareOptions, ct), context);
@@ -58,7 +58,7 @@ internal partial class RootCliCommand
             Console.WriteLine(sw.Elapsed);
 
             var destination = Destination ?? new FileInfo(Path.ChangeExtension(Source.FullName, ".sorted" + Path.GetExtension(Source.FullName)));
-            await new Merge<long>(destination, encoding, FlushMb).RunAsync(chunks, ct);
+            await new Merge<long>(destination, encoding, FlushMb, Source.Length).RunAsync(chunks, ct);
 
             foreach (var file in chunks)
             {
@@ -96,8 +96,8 @@ internal partial class RootCliCommand
         [CliOption(Name = "flush-mb", Description = "Unflushed bytes threshold for the chunk writer, MB (default: 1)")]
         public int FlushMb { get; set; } = 1;
 
-        [CliOption(Name = "zstd-level", Description = "Zstd compression level for chunk files (default: 9)")]
-        public int ZstdLevel { get; set; } = 9;
+        [CliOption(Name = "zstd-level", Description = "Zstd compression level for chunk files (default: 6)")]
+        public int ZstdLevel { get; set; } = 6;
 
         public Task<int> RunAsync(CliContext context) =>
             RootCliCommand.RunWithSettingsAsync(CompareOptionsName, async (encoding, compareOptions, ct) =>
