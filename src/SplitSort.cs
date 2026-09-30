@@ -16,14 +16,12 @@ class SplitSort<T>(
     FileInfo source,
     Encoding encoding,
     CompareOptions compareOptions,
-    int sortParallelism) where T : IBinaryInteger<T>
+    int sortParallelism,
+    int minChunkMb,
+    int maxChunkMb,
+    int flushMb,
+    int zstdLevel) where T : IBinaryInteger<T>
 {
-    // Адаптивный размер чанка ограничен снизу (больше параллелизма на маленьких файлах)
-    // и сверху (меньше накладных расходов merge на больших). Пул буферов округляет
-    // запрошенный размер вверх до степени двойки.
-    private const long MinBufferSize = 32 * 1024 * 1024;
-    private const long MaxBufferSize = 100 * 1024 * 1024;
-
     // Граница stackalloc для копий текста строки; больше — аренда из пула, чтобы не переполнить стек.
     private const int StackallocByteThreshold = 16 * 1024;
 
@@ -38,14 +36,16 @@ class SplitSort<T>(
     readonly CompareOptions compareOptions = compareOptions;
     readonly bool isUtf8 = encoding.WebName == "utf-8";
     readonly bool isOrdinal = compareOptions == CompareOptions.Ordinal;
-    readonly int bufferSize = ComputeBufferSize(source.Length);
+    readonly int bufferSize = ComputeBufferSize(source.Length, minChunkMb, maxChunkMb);
+    readonly int flushThreshold = flushMb * 1024 * 1024;
+    readonly int zstdLevel = zstdLevel;
     readonly ArrayPool<byte> arrayPool = ArrayPool<byte>.Shared;
     readonly ObjectPool<List<T>> listPool = new DefaultObjectPool<List<T>>(new ListPoolPolicy<T>());
-    readonly ObjectPool<Dictionary<ArraySegment<byte>, List<T>>> dictionaryPool = new DefaultObjectPool<Dictionary<ArraySegment<byte>, List<T>>>(new LookupPoolPolicy<T>());
+    readonly ObjectPool<Dictionary<BufferString, List<T>>> dictionaryPool = new DefaultObjectPool<Dictionary<BufferString, List<T>>>(new LookupPoolPolicy<T>());
 
     /// <summary>Адаптивный буфер чанка: большой файл — крупные чанки (меньше накладных расходов merge), маленький — мелкие (больше параллелизма).</summary>
-    private static int ComputeBufferSize(long fileLength) =>
-        (int)Math.Clamp(fileLength / (Environment.ProcessorCount * 2L), MinBufferSize, MaxBufferSize);
+    private static int ComputeBufferSize(long fileLength, int minChunkMb, int maxChunkMb) =>
+        (int)Math.Clamp(fileLength / (Environment.ProcessorCount * 2L), minChunkMb * 1024L * 1024L, maxChunkMb * 1024L * 1024L);
 
     /// <summary>
     /// Прогоняет конвейер разбиения и возвращает пути созданных промежуточных файлов (порядок не важен).
@@ -64,7 +64,6 @@ class SplitSort<T>(
             {
                 MaxDegreeOfParallelism = sortParallelism,
                 BoundedCapacity = sortParallelism * 2,
-                EnsureOrdered = false,
                 CancellationToken = ct,
             });
         var saver = new TransformBlock<Chunk<T>, FileInfo>(
@@ -78,14 +77,9 @@ class SplitSort<T>(
             {
                 MaxDegreeOfParallelism = 2,
                 BoundedCapacity = 4,
-                EnsureOrdered = false,
                 CancellationToken = ct,
             });
-        var fileNames = new BufferBlock<FileInfo>(new DataflowBlockOptions
-        {
-            EnsureOrdered = false,
-            CancellationToken = ct,
-        });
+        var fileNames = new BufferBlock<FileInfo>(new DataflowBlockOptions { CancellationToken = ct });
         var sorterToSaver = sorter.LinkTo(saver, new DataflowLinkOptions { PropagateCompletion = true });
         var saverToNames = saver.LinkTo(fileNames, new DataflowLinkOptions { PropagateCompletion = true });
 
@@ -109,10 +103,6 @@ class SplitSort<T>(
             await sorter.Completion.ConfigureAwait(false);
             await saver.Completion.ConfigureAwait(false);
         }
-        catch when (loopError is null)
-        {
-            throw;
-        }
         finally
         {
             sorterToSaver.Dispose();
@@ -134,7 +124,7 @@ class SplitSort<T>(
     /// </summary>
     private async IAsyncEnumerable<Chunk<T>> SplitToChunks(IAsyncEnumerable<ReadOnlySequence<byte>> lines, int bufferSize, [EnumeratorCancellation] CancellationToken ct = default)
     {
-        Chunk<T> chunk = new(arrayPool, listPool, dictionaryPool, bufferSize);
+        Chunk<T> chunk = new(listPool, dictionaryPool, bufferSize) { Id = Interlocked.Increment(ref chunkId) };
         await foreach (var line in lines.WithCancellation(ct).ConfigureAwait(false))
         {
             SequenceReader<byte> reader = new(line);
@@ -154,7 +144,7 @@ class SplitSort<T>(
             // Предыдущий словарь переполнился, выдаем словарь наружу, создаем новый и добавляем текст в него.
 
             yield return chunk;
-            chunk = new(arrayPool, listPool, dictionaryPool, bufferSize);
+            chunk = new(listPool, dictionaryPool, bufferSize) { Id = Interlocked.Increment(ref chunkId) };
             AddToChunk(chunk, x, text);
         }
         if (chunk is { Lookup.Count: 0 }) chunk.Dispose();
@@ -201,7 +191,7 @@ class SplitSort<T>(
     /// </summary>
     private async Task SortChunk(Chunk<T> chunk, CancellationToken ct)
     {
-        var valuesTask = Parallel.ForEachAsync(chunk.Lookup.Values, ct, (values, _) =>
+        var valuesTask = Parallel.ForEachAsync(chunk.Lookup.Values, new ParallelOptions { CancellationToken = ct }, (values, _) =>
         {
             values.Sort();
             return ValueTask.CompletedTask;
@@ -211,7 +201,8 @@ class SplitSort<T>(
         {
             chunk.Sorted = chunk.Lookup
                 .AsParallel()
-                .OrderBy(kvp => kvp.Key, SortKeyComparer.Instance)
+                .WithCancellation(ct)
+                .OrderBy(kvp => kvp.Key, chunk.Comparer)
                 .Select(kvp => new ChunkEntry<T>(kvp.Key, default, kvp.Value))
                 .ToList();
         }
@@ -219,37 +210,51 @@ class SplitSort<T>(
         {
             var maxKeyBytes = 0;
             foreach (var key in chunk.Lookup.Keys)
-                maxKeyBytes = Math.Max(maxKeyBytes, key.Count);
+                maxKeyBytes = Math.Max(maxKeyBytes, key.Length);
             var decodedBuffer = new char[encoding.GetMaxCharCount(maxKeyBytes)];
 
-            // Пасс 1: точный суммарный размер sort key всех ключей.
-            var sortKeySize = 0;
-            foreach (var kvp in chunk.Lookup)
+            // Один нативный буфер на все sort keys чанка. Бюджет — суммарные байты ключей × 1.5
+            // (без пасса GetSortKeyLength); при нехватке буфер удваивается и ключи пишутся заново.
+            chunk.AllocateSortKeys(Math.Max(16, chunk.Used * 3 / 2));
+            List<ChunkEntry<T>> entries;
+            while (true)
             {
-                var written = encoding.GetChars(kvp.Key, decodedBuffer);
-                sortKeySize += compareInfo.GetSortKeyLength(decodedBuffer.AsSpan(0, written), compareOptions);
-            }
-
-            // Пасс 2: CompareInfo.GetSortKey → байты в общий короткоживущий массив.
-            var sortKeys = new byte[sortKeySize];
-            var entries = new List<(ArraySegment<byte> Key, ArraySegment<byte> SortKey, List<T> Values)>(chunk.Lookup.Count);
-            var offset = 0;
-            foreach (var kvp in chunk.Lookup)
-            {
-                var written = encoding.GetChars(kvp.Key, decodedBuffer);
-                var length = compareInfo.GetSortKey(decodedBuffer.AsSpan(0, written), sortKeys.AsSpan(offset), compareOptions);
-                entries.Add((kvp.Key, new ArraySegment<byte>(sortKeys, offset, length), kvp.Value));
-                offset += length;
+                entries = new List<ChunkEntry<T>>(chunk.Lookup.Count);
+                var offset = 0;
+                var overflow = false;
+                foreach (var kvp in chunk.Lookup)
+                {
+                    var written = encoding.GetChars(chunk.BufferSpan.Slice(kvp.Key.Offset, kvp.Key.Length), decodedBuffer);
+                    var keyChars = decodedBuffer.AsSpan(0, written);
+                    int length;
+                    try
+                    {
+                        length = compareInfo.GetSortKey(keyChars, chunk.SortKeySpanFrom(offset), compareOptions);
+                    }
+                    catch (ArgumentException)
+                    {
+                        chunk.GrowSortKeys();
+                        overflow = true;
+                        break;
+                    }
+                    entries.Add(new ChunkEntry<T>(kvp.Key, new BufferString(offset, length), kvp.Value));
+                    offset += length;
+                }
+                if (!overflow)
+                    break;
             }
 
             chunk.Sorted = entries
                 .AsParallel()
-                .OrderBy(e => e.SortKey, SortKeyComparer.Instance)
+                .WithCancellation(ct)
+                .OrderBy(e => e.SortKey, chunk.CreateSortKeyComparer())
                 .Select(e => new ChunkEntry<T>(e.Key, e.SortKey, e.Values))
                 .ToList();
         }
 
         await valuesTask.ConfigureAwait(false);
+        // Словарь и списки значений больше не нужны — возвращаем в пулы до записи файла.
+        chunk.ReleaseLookup();
     }
 
     /// <summary>
@@ -262,15 +267,16 @@ class SplitSort<T>(
         var index = Interlocked.Increment(ref savedChunkCount) - 1;
         var chunkFile = new FileInfo(Path.ChangeExtension(source.FullName, $".chunk-{index:D3}{Path.GetExtension(source.FullName)}"));
         await using var fileStream = chunkFile.Create();
-        await using var zstdStream = new CompressionStream(fileStream, SortConstants.ZstdCompressionLevel);
+        await using var zstdStream = new CompressionStream(fileStream, zstdLevel);
         var writer = PipeWriter.Create(zstdStream);
         foreach (var entry in chunk.Sorted!)
         {
-            writer.WriteVarint((ulong)entry.Key.Count);
-            writer.Write(entry.Key.AsSpan());
-            writer.WriteVarint((ulong)entry.SortKey.Count);
-            if (entry.SortKey.Count > 0)
-                writer.Write(entry.SortKey.AsSpan());
+            var keySpan = chunk.BufferSpan.Slice(entry.Key.Offset, entry.Key.Length);
+            writer.WriteVarint((ulong)keySpan.Length);
+            writer.Write(keySpan);
+            writer.WriteVarint((ulong)entry.SortKey.Length);
+            if (entry.SortKey.Length > 0)
+                writer.Write(chunk.GetSortKeySlice(entry.SortKey.Offset, entry.SortKey.Length));
             writer.WriteVarint((ulong)entry.Values.Count);
             T previous = T.Zero;
             foreach (var value in entry.Values)
@@ -278,14 +284,15 @@ class SplitSort<T>(
                 writer.WriteVarint(ulong.CreateChecked(value - previous));
                 previous = value;
             }
-            if (writer.UnflushedBytes >= SortConstants.FlushThreshold)
+            if (writer.UnflushedBytes >= flushThreshold)
                 await writer.FlushAsync(ct).ConfigureAwait(false);
         }
         await writer.FlushAsync(ct).ConfigureAwait(false);
         await writer.CompleteAsync().ConfigureAwait(false);
+        chunk.ReleaseSortKeys();
         // Dispose zstd-потока дописывает footer кадра; await using закрывает его и файл.
         return chunkFile;
     }
-
     private int savedChunkCount;
+    private int chunkId;
 }

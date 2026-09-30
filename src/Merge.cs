@@ -10,12 +10,13 @@ using ZstdSharp;
 /// Фаза слияния: мержит отсортированные промежуточные файлы в один итоговый.
 /// Sort key уже вычислены при split и сохранены в чанках — слияние только сравнивает их как байты.
 /// </summary>
-class Merge<T>(FileInfo destination, Encoding encoding) where T : IBinaryInteger<T>
+class Merge<T>(FileInfo destination, Encoding encoding, int flushMb) where T : IBinaryInteger<T>
 {
     readonly FileInfo destination = destination;
     readonly Encoding encoding = encoding;
     readonly byte[] newLine = encoding.GetBytes(Environment.NewLine);
     readonly byte[] dotSpace = encoding.GetBytes(". ");
+    readonly int flushThreshold = flushMb * 1024 * 1024;
 
 
     /// <summary>
@@ -29,6 +30,7 @@ class Merge<T>(FileInfo destination, Encoding encoding) where T : IBinaryInteger
         var sources = chunkFiles.Select(c => new DecompressionStream(c.OpenRead(), leaveOpen: false)
             .ReadChunkEntries<T>(ct));
 
+
         var number = new char[32];
         await foreach (var group in sources.MergeSorted(ChunkEntryComparer<T>.Instance, MergeGroup, ct).WithCancellation(ct).ConfigureAwait(false))
         {
@@ -40,7 +42,7 @@ class Merge<T>(FileInfo destination, Encoding encoding) where T : IBinaryInteger
                 writer.Write(text.AsSpan());
                 writer.Write(newLine);
             }
-            if (writer.UnflushedBytes >= SortConstants.FlushThreshold)
+            if (writer.UnflushedBytes >= flushThreshold)
                 await writer.FlushAsync(ct).ConfigureAwait(false);
         }
         await writer.FlushAsync(ct).ConfigureAwait(false);

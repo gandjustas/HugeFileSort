@@ -82,6 +82,20 @@ static class Extensions
 
     }
 
+    /// <summary>Пишет число в формате LEB128 varint в поток.</summary>
+    public static void WriteVarint(this Stream stream, ulong value)
+    {
+        Span<byte> buffer = stackalloc byte[10];
+        var i = 0;
+        while (value >= 0x80)
+        {
+            buffer[i++] = (byte)(value | 0x80);
+            value >>= 7;
+        }
+        buffer[i++] = (byte)value;
+        stream.Write(buffer[..i]);
+    }
+
     /// <summary>
     /// Читает LEB128 varint. false — данных недостаточно (нужен ещё ReadAsync);
     /// FormatException — больше 10 байт без терминатора, файл повреждён.
