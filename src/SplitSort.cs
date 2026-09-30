@@ -332,19 +332,13 @@ class SplitSort<T>(
         using var zstdStream = new CompressionStream(fileStream, zstdLevel);
         var writer = PipeWriter.Create(zstdStream, new StreamPipeWriterOptions(leaveOpen: true));
         var textOffsets = chunk.TextOffsets!;
-        var sortKeyOffsets = chunk.SortKeyOffsets;
-        var sortKeyLengths = chunk.SortKeyLengths;
         var values = chunk.Values!;
         var csr = chunk.CsrOffsets!;
-        var ordinal = sortKeyOffsets is null; // ordinal-режим: sort key не вычислялись, keyLen = 0
         foreach (var i in chunk.Order!)
         {
             var keySpan = chunk.BufferSpan.Slice(textOffsets[i], textOffsets[i + 1] - textOffsets[i]);
             writer.WriteVarint((ulong)keySpan.Length);
             writer.Write(keySpan);
-            writer.WriteVarint(ordinal ? 0UL : (ulong)sortKeyLengths![i]);
-            if (!ordinal)
-                writer.Write(chunk.GetSortKeySlice(sortKeyOffsets![i], sortKeyLengths![i]));
             var start = csr[i];
             var count = csr[i + 1] - start;
             writer.WriteVarint((ulong)count);
@@ -381,11 +375,6 @@ class SplitSort<T>(
             var textLen = textOffsets[i + 1] - textOffsets[i];
             var count = csr[i + 1] - csr[i];
             total += VarintSize((ulong)textLen) + textLen + VarintSize((ulong)count);
-            if (sortKeyLengths is not null)
-            {
-                var keyLen = sortKeyLengths[i];
-                total += VarintSize((ulong)keyLen) + keyLen;
-            }
             T previous = T.Zero;
             for (var j = csr[i]; j < csr[i + 1]; j++)
             {

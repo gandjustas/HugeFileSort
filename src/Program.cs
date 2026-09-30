@@ -35,14 +35,17 @@ internal partial class RootCliCommand
         [CliOption(Name = "min-chunk-mb", Description = "Lower bound of the adaptive chunk buffer, MB (default: 32)")]
         public int MinChunkMb { get; set; } = 32;
 
-        [CliOption(Name = "max-chunk-mb", Description = "Upper bound of the adaptive chunk buffer, MB (default: 100)")]
-        public int MaxChunkMb { get; set; } = 100;
+        [CliOption(Name = "max-chunk-mb", Description = "Upper bound of the adaptive chunk buffer, MB (default: 500)")]
+        public int MaxChunkMb { get; set; } = 500;
 
         [CliOption(Name = "flush-mb", Description = "Unflushed bytes threshold for the output writer, MB (default: 1)")]
         public int FlushMb { get; set; } = 1;
 
         [CliOption(Name = "zstd-level", Description = "Zstd compression level for chunk files (default: 6)")]
         public int ZstdLevel { get; set; } = 6;
+
+        [CliOption(Name = "prefetch", Description = "Number of chunk files prefetched into the OS cache during merge (default: 0 = off)")]
+        public int Prefetch { get; set; } = 0;
 
         public Task<int> RunAsync(CliContext context) =>
             RootCliCommand.RunWithSettingsAsync(CompareOptionsName, (encoding, compareOptions, ct) => SortAsync(encoding, compareOptions, ct), context);
@@ -58,7 +61,7 @@ internal partial class RootCliCommand
             Console.WriteLine(sw.Elapsed);
 
             var destination = Destination ?? new FileInfo(Path.ChangeExtension(Source.FullName, ".sorted" + Path.GetExtension(Source.FullName)));
-            await new Merge<long>(destination, encoding, FlushMb, Source.Length).RunAsync(chunks, ct);
+            await new Merge<long>(destination, encoding, FlushMb, compareOptions, Prefetch, Source.Length).RunAsync(chunks, ct);
 
             foreach (var file in chunks)
             {
@@ -90,8 +93,8 @@ internal partial class RootCliCommand
         [CliOption(Name = "min-chunk-mb", Description = "Lower bound of the adaptive chunk buffer, MB (default: 32)")]
         public int MinChunkMb { get; set; } = 32;
 
-        [CliOption(Name = "max-chunk-mb", Description = "Upper bound of the adaptive chunk buffer, MB (default: 100)")]
-        public int MaxChunkMb { get; set; } = 100;
+        [CliOption(Name = "max-chunk-mb", Description = "Upper bound of the adaptive chunk buffer, MB (default: 500)")]
+        public int MaxChunkMb { get; set; } = 500;
 
         [CliOption(Name = "flush-mb", Description = "Unflushed bytes threshold for the chunk writer, MB (default: 1)")]
         public int FlushMb { get; set; } = 1;
@@ -120,10 +123,16 @@ internal partial class RootCliCommand
         [CliOption(Name = "flush-mb", Description = "Unflushed bytes threshold for the output writer, MB (default: 1)")]
         public int FlushMb { get; set; } = 1;
 
-        public Task<int> RunAsync(CliContext context) =>
-            RootCliCommand.RunWithSettingsAsync("None", (encoding, _, ct) => MergeAsync(encoding, ct), context);
+        [CliOption(Name = "compare-options", Description = "Text comparison used at split: None (default), Ordinal, IgnoreCase, IgnoreNonSpace, IgnoreSymbols, or a combination")]
+        public string CompareOptionsName { get; set; } = "None";
 
-        private async Task<int> MergeAsync(Encoding encoding, CancellationToken ct)
+        [CliOption(Name = "prefetch", Description = "Number of chunk files prefetched into the OS cache during merge (default: 0 = off)")]
+        public int Prefetch { get; set; } = 0;
+
+        public Task<int> RunAsync(CliContext context) =>
+            RootCliCommand.RunWithSettingsAsync(CompareOptionsName, (encoding, compareOptions, ct) => MergeAsync(encoding, compareOptions, ct), context);
+
+        private async Task<int> MergeAsync(Encoding encoding, CompareOptions compareOptions, CancellationToken ct)
         {
             List<FileInfo> chunks = [];
             while (Console.ReadLine() is { } line)
@@ -132,7 +141,7 @@ internal partial class RootCliCommand
                 if (line.Length != 0)
                     chunks.Add(new FileInfo(line));
             }
-            await new Merge<long>(Destination, encoding, FlushMb).RunAsync(chunks, ct);
+            await new Merge<long>(Destination, encoding, FlushMb, compareOptions, Prefetch).RunAsync(chunks, ct);
             return 0;
         }
     }

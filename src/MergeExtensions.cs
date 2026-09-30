@@ -1,23 +1,29 @@
 using System.Buffers;
+using System.Globalization;
 using System.IO.Pipelines;
+using System.Text;
 using System.Runtime.CompilerServices;
 using System.Numerics;
 using Microsoft.Extensions.ObjectPool;
 
 static class MergeExtensions
 {
+    // Граница stackalloc для декодирующего char-буфера записи (8K char = 16КБ); больше — аренда из пула.
+    private const int StackallocCharThreshold = 8 * 1024;
+
     /// <summary>
-    /// Читает промежуточный файл (формат чанка v2, все числа — LEB128 varint:
-    /// varint(длина текста) текст varint(длина sort key) [sort key] varint(кол-во) varint(δ0) varint(δ1)...).
-    /// keyLen == 0 — ordinal-режим: sort key это сами байты текста.
-    /// Ключи уже вычислены при split — merge их только читает и сравнивает как байты.
-    /// Буферы записей (текст, sort key, список значений) берутся из пулов;
-    /// обязанность вернуть их в пулы — у потребителя записи (ReadChunkEntry.Dispose).
-    /// Потоком и reader'ом владеет итератор: CompleteAsync + DisposeAsync в finally
-    /// (PipeReader не закрывает поток сам, а незакрытый файл нельзя удалить).
+    /// Читает промежуточный файл (формат чанка v3, все числа — LEB128 varint:
+    /// varint(длина текста) текст varint(кол-во) varint(δ0) varint(δ1)...).
+    /// Sort key в файле не хранится — вычисляется при чтении (ordinal: ключ = байты текста;
+    /// культура: декодирование → GetSortKey). Буферы записей (текст, sort key, список значений)
+    /// берутся из пулов; вернуть их в пулы обязан потребитель записи (ReadChunkEntry.Dispose).
+    /// Потоком и reader'ом владеет итератор: CompleteAsync + DisposeAsync в finally.
     /// </summary>
     public static async IAsyncEnumerable<ReadChunkEntry<T>> ReadChunkEntries<T>(
         this Stream stream,
+        Encoding encoding,
+        CompareInfo compareInfo,
+        CompareOptions compareOptions,
         [EnumeratorCancellation] CancellationToken ct = default) where T : IBinaryInteger<T>
     {
         var reader = PipeReader.Create(stream);
@@ -34,7 +40,7 @@ static class MergeExtensions
                 {
                     // Пытаемся разобрать одну запись; на недостатке данных — откат и дозагрузка.
                     entryReader = new SequenceReader<byte>(buffer);
-                    if (!TryReadEntry(ref entryReader, out var entry, listPool))
+                    if (!TryReadEntry(ref entryReader, out var entry, listPool, encoding, compareInfo, compareOptions))
                         break;
                     buffer = buffer.Slice(entryReader.Position);
                     yield return entry;
@@ -60,7 +66,10 @@ static class MergeExtensions
         static bool TryReadEntry(
             ref SequenceReader<byte> entryReader,
             out ReadChunkEntry<T> entry,
-            ObjectPool<List<T>> listPool)
+            ObjectPool<List<T>> listPool,
+            Encoding encoding,
+            CompareInfo compareInfo,
+            CompareOptions compareOptions)
         {
             entry = null!;
             if (!Extensions.TryReadVarint(ref entryReader, out var textLength))
@@ -71,24 +80,13 @@ static class MergeExtensions
             byte[]? textBuffer = null;
             byte[]? sortKeyBuffer = null;
             List<T>? values = null;
+            char[]? rentedChars = null;
             try
             {
                 // Текст: аренда из пула, сегмент хранит точную длину.
                 textBuffer = ArrayPool<byte>.Shared.Rent((int)textLength);
                 entryReader.TryCopyTo(textBuffer.AsSpan(0, (int)textLength));
                 entryReader.Advance((long)textLength);
-
-                // Sort key: keyLen == 0 — ordinal-режим, ключом служит сам текст (тот же сегмент).
-                if (!Extensions.TryReadVarint(ref entryReader, out var sortKeyLength))
-                    return false;
-                if (sortKeyLength > 0)
-                {
-                    if (entryReader.Remaining < (long)sortKeyLength)
-                        return false;
-                    sortKeyBuffer = ArrayPool<byte>.Shared.Rent((int)sortKeyLength);
-                    entryReader.TryCopyTo(sortKeyBuffer.AsSpan(0, (int)sortKeyLength));
-                    entryReader.Advance((long)sortKeyLength);
-                }
 
                 if (!Extensions.TryReadVarint(ref entryReader, out var count))
                     return false;
@@ -102,11 +100,19 @@ static class MergeExtensions
                     values.Add(previous);
                 }
 
+                // Sort key: декодируем текст и вычисляем (ICU пишет строго в границах приёмника).
+                var maxChars = encoding.GetMaxCharCount((int)textLength);
+                Span<char> chars = maxChars <= StackallocCharThreshold
+                    ? stackalloc char[StackallocCharThreshold]
+                    : (rentedChars = ArrayPool<char>.Shared.Rent(maxChars));
+                var written = encoding.GetChars(textBuffer.AsSpan(0, (int)textLength), chars);
+                var keyChars = chars[..written];
+                sortKeyBuffer = ArrayPool<byte>.Shared.Rent(compareInfo.GetSortKeyLength(keyChars, compareOptions));
+                var keyLength = compareInfo.GetSortKey(keyChars, sortKeyBuffer, compareOptions);
+
                 entry = new ReadChunkEntry<T>(
                     new ArraySegment<byte>(textBuffer, 0, (int)textLength),
-                    sortKeyBuffer is null
-                        ? new ArraySegment<byte>(textBuffer, 0, (int)textLength)
-                        : new ArraySegment<byte>(sortKeyBuffer, 0, (int)sortKeyLength),
+                    new ArraySegment<byte>(sortKeyBuffer, 0, keyLength),
                     values, listPool);
 
                 // Владение перешло к записи.
@@ -120,6 +126,7 @@ static class MergeExtensions
                 if (textBuffer is not null) ArrayPool<byte>.Shared.Return(textBuffer);
                 if (sortKeyBuffer is not null) ArrayPool<byte>.Shared.Return(sortKeyBuffer);
                 if (values is not null) listPool.Return(values);
+                if (rentedChars is not null) ArrayPool<char>.Shared.Return(rentedChars);
             }
         }
     }
