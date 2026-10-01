@@ -65,7 +65,7 @@ class SplitSort<T>(
             new ExecutionDataflowBlockOptions
             {
                 MaxDegreeOfParallelism = sortParallelism,
-                BoundedCapacity = sortParallelism * 2,
+                BoundedCapacity = sortParallelism + 2,
                 CancellationToken = ct,
             });
         var saver = new TransformBlock<Chunk<T>, FileInfo>(
@@ -78,7 +78,7 @@ class SplitSort<T>(
             new ExecutionDataflowBlockOptions
             {
                 MaxDegreeOfParallelism = 2,
-                BoundedCapacity = 4,
+                BoundedCapacity = sortParallelism + 2,
                 CancellationToken = ct,
             });
         var fileNames = new BufferBlock<FileInfo>(new DataflowBlockOptions { CancellationToken = ct });
@@ -237,11 +237,8 @@ class SplitSort<T>(
     private async Task SortChunk(Chunk<T> chunk, CancellationToken ct)
     {
         var keyCount = chunk.KeyCount;
-        var maxKeyBytes = 0;
-        foreach (var key in chunk.Lookup.Keys)
-            maxKeyBytes = Math.Max(maxKeyBytes, key.Length);
-        var decodedBuffer = new char[encoding.GetMaxCharCount(maxKeyBytes)];
-
+        var maxKeyBytes = chunk.TextLengths.Count > 0 ? chunk.TextLengths.Max() : 0;
+        var maxChars = encoding.GetMaxCharCount(maxKeyBytes);
         // Смещения текстов: тексты лежат в буфере подряд в порядке номеров.
         var textOffsets = new int[keyCount + 1];
         for (var i = 0; i < keyCount; i++)
@@ -250,18 +247,25 @@ class SplitSort<T>(
 
         int[] sortKeyOffsets = [];
         int[] sortKeyLengths = [];
+        var parallelOptions = new ParallelOptions { CancellationToken = ct };
 
         if (!isOrdinal)
         {
-            // Пасс 1: точная длина sort key каждого ключа.
+            // Пасс A (параллельно): точная длина sort key каждого ключа.
             var sortKeyLengthsByNumber = new int[keyCount];
+            Parallel.For(0, keyCount, parallelOptions,
+                () => new char[maxChars],
+                (i, _, buf) =>
+                {
+                    var w = encoding.GetChars(chunk.BufferSpan.Slice(textOffsets[i], chunk.TextLengths[i]), buf);
+                    sortKeyLengthsByNumber[i] = compareInfo.GetSortKeyLength(buf.AsSpan(0, w), compareOptions);
+                    return buf;
+                },
+                _ => { });
+
             var totalSortKey = 0;
-            foreach (var kvp in chunk.Lookup)
-            {
-                var written = encoding.GetChars(chunk.BufferSpan.Slice(kvp.Key.Offset, kvp.Key.Length), decodedBuffer);
-                totalSortKey += sortKeyLengthsByNumber[kvp.Value.Number] =
-                    compareInfo.GetSortKeyLength(decodedBuffer.AsSpan(0, written), compareOptions);
-            }
+            for (var i = 0; i < keyCount; i++)
+                totalSortKey += sortKeyLengthsByNumber[i];
             chunk.AllocateSortKeys(totalSortKey);
             sortKeyOffsets = new int[keyCount + 1];
             for (var i = 0; i < keyCount; i++)
@@ -276,8 +280,6 @@ class SplitSort<T>(
         var csr = chunk.CsrOffsets!;
 
         // Параллельно: sort key каждого ключа (culture) и сортировка его CSR-диапазона.
-        var maxChars = encoding.GetMaxCharCount(chunk.TextLengths.Count > 0 ? chunk.TextLengths.Max() : 0);
-        var parallelOptions = new ParallelOptions { CancellationToken = ct };
         var csrValues = chunk.Values!;
         Parallel.For(0, keyCount, parallelOptions,
             () => new char[maxChars],
