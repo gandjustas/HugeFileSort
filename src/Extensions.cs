@@ -9,6 +9,16 @@ using MessagePack;
 
 static class Extensions
 {
+    // Трассировка стадий конвейера (stderr) — включается переменной окружения HFS_TRACE=1.
+    internal static readonly bool TraceEnabled = Environment.GetEnvironmentVariable("HFS_TRACE") == "1";
+    internal static readonly System.Diagnostics.Stopwatch TraceWatch = System.Diagnostics.Stopwatch.StartNew();
+
+    internal static void Trace(string message)
+    {
+        if (TraceEnabled)
+            Console.Error.WriteLine($"[{TraceWatch.Elapsed.TotalSeconds:F2}] {message}");
+    }
+
     public static async IAsyncEnumerable<T> DeserializeAsyncEnumerable<T>(
         this Stream stream,
         MessagePackSerializerOptions? options = null,
@@ -65,6 +75,14 @@ static class Extensions
             writer.Advance(l);
         }
 
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public void Write(ReadOnlySpan<byte> value)
+        {
+            var destination = writer.GetSpan(value.Length);
+            value.CopyTo(destination);
+            writer.Advance(value.Length);
+        }
+
         /// <summary>Пишет число в формате LEB128 varint: 7 бит на байт, старший бит — флаг продолжения.</summary>
         public void WriteVarint(ulong value)
         {
@@ -94,6 +112,43 @@ static class Extensions
         }
         buffer[i++] = (byte)value;
         stream.Write(buffer[..i]);
+    }
+
+    /// <summary>Пишет LEB128 varint в буфер, возвращает новую позицию.</summary>
+    public static int WriteVarint(Span<byte> destination, int pos, ulong value)
+    {
+        while (value >= 0x80)
+        {
+            destination[pos++] = (byte)(value | 0x80);
+            value >>= 7;
+        }
+        destination[pos++] = (byte)value;
+        return pos;
+    }
+
+    /// <summary>
+    /// Читает LEB128 varint из буфера. false — данных недостаточно (pos мог сдвинуться —
+    /// вызывающий откатывает на начало записи); FormatException — больше 10 байт без терминатора.
+    /// </summary>
+    public static bool TryReadVarint(ReadOnlySpan<byte> span, ref int pos, out ulong value)
+    {
+        value = 0;
+        ulong result = 0;
+        var shift = 0;
+        for (var i = 0; i < 10; i++)
+        {
+            if (pos >= span.Length)
+                return false;
+            var b = span[pos++];
+            result |= (ulong)(b & 0x7F) << shift;
+            if ((b & 0x80) == 0)
+            {
+                value = result;
+                return true;
+            }
+            shift += 7;
+        }
+        throw new FormatException("Varint is too long, file is corrupted");
     }
 
     /// <summary>

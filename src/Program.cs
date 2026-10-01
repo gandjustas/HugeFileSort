@@ -41,11 +41,8 @@ internal partial class RootCliCommand
         [CliOption(Name = "flush-mb", Description = "Unflushed bytes threshold for the output writer, MB (default: 32)")]
         public int FlushMb { get; set; } = 32;
 
-        [CliOption(Name = "zstd-level", Description = "Zstd compression level for chunk files (default: 6)")]
-        public int ZstdLevel { get; set; } = 6;
-
-        [CliOption(Name = "prefetch", Description = "Number of chunk files prefetched into the OS cache during merge (default: 0 = off)")]
-        public int Prefetch { get; set; } = 0;
+        [CliOption(Name = "zstd-level", Description = "Zstd compression level for chunk files, 1-22 (default: 9)")]
+        public int ZstdLevel { get; set; } = 9;
 
         public Task<int> RunAsync(CliContext context) =>
             RootCliCommand.RunWithSettingsAsync(CompareOptionsName, (encoding, compareOptions, ct) => SortAsync(encoding, compareOptions, ct), context);
@@ -54,14 +51,14 @@ internal partial class RootCliCommand
         {
             var sw = Stopwatch.StartNew();
             var chunks = await new SplitSort<long>(Source, encoding, compareOptions, Parallelism,
-                MinChunkMb, MaxChunkMb, FlushMb, ZstdLevel).RunAsync(ct);
+                MinChunkMb, MaxChunkMb, ZstdLevel).RunAsync(ct);
             foreach (var file in chunks)
                 Console.WriteLine(file.FullName);
             Console.WriteLine($"Chunks: {chunks.Count}");
             Console.WriteLine(sw.Elapsed);
 
             var destination = Destination ?? new FileInfo(Path.ChangeExtension(Source.FullName, ".sorted" + Path.GetExtension(Source.FullName)));
-            await new Merge<long>(destination, encoding, FlushMb, compareOptions, Prefetch, Source.Length).RunAsync(chunks, ct);
+            await new Merge<long>(destination, encoding, FlushMb, compareOptions, Source.Length).RunAsync(chunks, ct);
 
             foreach (var file in chunks)
             {
@@ -96,17 +93,14 @@ internal partial class RootCliCommand
         [CliOption(Name = "max-chunk-mb", Description = "Upper bound of the adaptive chunk buffer, MB (default: 500)")]
         public int MaxChunkMb { get; set; } = 500;
 
-        [CliOption(Name = "flush-mb", Description = "Unflushed bytes threshold for the chunk writer, MB (default: 32)")]
-        public int FlushMb { get; set; } = 32;
-
-        [CliOption(Name = "zstd-level", Description = "Zstd compression level for chunk files (default: 6)")]
-        public int ZstdLevel { get; set; } = 6;
+        [CliOption(Name = "zstd-level", Description = "Zstd compression level for chunk files, 1-22 (default: 9)")]
+        public int ZstdLevel { get; set; } = 9;
 
         public Task<int> RunAsync(CliContext context) =>
             RootCliCommand.RunWithSettingsAsync(CompareOptionsName, async (encoding, compareOptions, ct) =>
             {
                 var files = await new SplitSort<long>(Source, encoding, compareOptions, Parallelism,
-                    MinChunkMb, MaxChunkMb, FlushMb, ZstdLevel).RunAsync(ct);
+                    MinChunkMb, MaxChunkMb, ZstdLevel).RunAsync(ct);
                 foreach (var file in files)
                     Console.WriteLine(file.FullName);
                 return 0;
@@ -126,9 +120,6 @@ internal partial class RootCliCommand
         [CliOption(Name = "compare-options", Description = "Text comparison used at split: None (default), Ordinal, IgnoreCase, IgnoreNonSpace, IgnoreSymbols, or a combination")]
         public string CompareOptionsName { get; set; } = "None";
 
-        [CliOption(Name = "prefetch", Description = "Number of chunk files prefetched into the OS cache during merge (default: 0 = off)")]
-        public int Prefetch { get; set; } = 0;
-
         public Task<int> RunAsync(CliContext context) =>
             RootCliCommand.RunWithSettingsAsync(CompareOptionsName, (encoding, compareOptions, ct) => MergeAsync(encoding, compareOptions, ct), context);
 
@@ -141,7 +132,7 @@ internal partial class RootCliCommand
                 if (line.Length != 0)
                     chunks.Add(new FileInfo(line));
             }
-            await new Merge<long>(Destination, encoding, FlushMb, compareOptions, Prefetch).RunAsync(chunks, ct);
+            await new Merge<long>(Destination, encoding, FlushMb, compareOptions).RunAsync(chunks, ct);
             return 0;
         }
     }
@@ -206,7 +197,7 @@ internal partial class RootCliCommand
         {
             var encoding = Encoding.UTF8;
             var ct = context.CancellationToken;
-            var sort = new SplitSort<long>(Source, encoding, CompareOptions.Ordinal, 1, 32, 100, 1, 9);
+            var sort = new SplitSort<long>(Source, encoding, CompareOptions.Ordinal, 1, 32, 100, 9);
             var newLine = encoding.GetBytes(Environment.NewLine);
             var reader = PipeReader.Create(Source.OpenRead());
             var b = BindingFlags.NonPublic | BindingFlags.Instance;
@@ -259,7 +250,7 @@ internal partial class RootCliCommand
                 encoding.GetBytes(". ", writer);
                 encoding.GetBytes(RandomString(random, random.Next(textBuffer.Length), textBuffer), writer);
                 writer.Write(newLine);
-                if (writer.UnflushedBytes > Size)
+                if (writer.UnflushedBytes >= 8 << 20)
                 {
                     written += writer.UnflushedBytes;
                     await writer.FlushAsync(ct);

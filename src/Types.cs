@@ -77,37 +77,84 @@ sealed unsafe class NativeSegmentComparer(byte* buffer) : IComparer<BufferString
 }
 
 /// <summary>
-/// Запись промежуточного файла при чтении: текст и sort key — сегменты арендованных из ArrayPool массивов,
-/// значения — список из ObjectPool. Владелец обязан вызвать Dispose, когда запись больше не нужна
-/// (MergeSorted делает это сразу после продвижения потока мимо записи).
+/// Запись промежуточного файла при merge: текст и sort key — сегменты буферов пакета (Batch),
+/// значения — срез общего массива значений пакета. Dispose уменьшает счётчик пакета: последний
+/// возврат возвращает буферы пакета в пулы (MergeSorted делает это после потребления группы).
 /// </summary>
-sealed class ReadChunkEntry<T> : IDisposable where T : IBinaryInteger<T>
+sealed class ReadChunkEntry<T>(
+    Batch<T> batch,
+    ArraySegment<byte> text,
+    ArraySegment<byte> sortKey,
+    T[] values,
+    int valuesStart,
+    int valuesCount) where T : IBinaryInteger<T>
 {
-    private readonly ObjectPool<List<T>> listPool;
-
     /// <summary>Байты текста в кодировке файла.</summary>
-    public ArraySegment<byte> Text { get; }
+    public ArraySegment<byte> Text { get; } = text;
 
-    /// <summary>Явный sort key текста (вычисляется при split, сравнения в хипе — побайтовые).</summary>
-    public ArraySegment<byte> SortKey { get; }
+    /// <summary>Явный sort key текста (ordinal: алиас текста; культура: сегмент буфера пакета).</summary>
+    public ArraySegment<byte> SortKey { get; } = sortKey;
 
-    public List<T> Values { get; }
+    /// <summary>Общий массив значений пакета (срез — по ValuesStart/ValuesCount).</summary>
+    public T[] ValuesArray { get; } = values;
 
-    public ReadChunkEntry(ArraySegment<byte> text, ArraySegment<byte> sortKey, List<T> values, ObjectPool<List<T>> listPool)
+    public int ValuesStart { get; } = valuesStart;
+
+    public int ValuesCount { get; } = valuesCount;
+
+    public void Dispose() => batch.Release();
+}
+
+/// <summary>
+/// Пакет записей одного чанка при merge: арендованный буфер текстов (записи ссылаются в него
+/// zero-copy), буфер sort key (в ordinal-режиме не выделяется) и общий массив значений.
+/// Пакет живёт, пока merge не потребит все записи: каждая ReadChunkEntry.Dispose уменьшает
+/// счётчик, последний возвращает массивы в пулы.
+/// </summary>
+sealed class Batch<T>(byte[] buffer, byte[]? sortKeyBuffer, T[] values, int entryCount) where T : IBinaryInteger<T>
+{
+    private readonly byte[] buffer = buffer;
+    private readonly byte[]? sortKeyBuffer = sortKeyBuffer;
+    private readonly T[] values = values;
+    private int remaining = entryCount;
+
+    /// <summary>Записи пакета; заполняется после создания пакета.</summary>
+    public ReadChunkEntry<T>[] Entries { get; set; } = [];
+
+    /// <summary>Вызывается при потреблении очередной записи; последний возврат — буферы в пулы.</summary>
+    public void Release()
     {
-        Text = text;
-        SortKey = sortKey;
-        Values = values;
-        this.listPool = listPool;
+        if (Interlocked.Decrement(ref remaining) == 0)
+        {
+            ArrayPool<byte>.Shared.Return(buffer);
+            if (sortKeyBuffer is not null)
+                ArrayPool<byte>.Shared.Return(sortKeyBuffer);
+        }
+    }
+}
+
+/// <summary>Метаданные записи пакета: смещение/длина текста, диапазон значений в общем массиве.</summary>
+readonly record struct BatchEntryMeta(int TextOffset, int TextLength, int ValuesStart, int ValuesCount);
+
+/// <summary>Сжатый чанк в памяти: файл назначения и нативный буфер сжатых данных (освобождает писатель).</summary>
+unsafe struct CompressedChunk : IDisposable
+{
+    public readonly FileInfo File;
+    public byte* Buffer;
+    public readonly int Length;
+
+    public CompressedChunk(FileInfo file, byte* buffer, int length)
+    {
+        File = file;
+        Buffer = buffer;
+        Length = length;
     }
 
-    public void Dispose()
+    public unsafe void Dispose()
     {
-        ArrayPool<byte>.Shared.Return(Text.Array!);
-        // В ordinal-режиме SortKey указывает на тот же массив, что и Text, — вернуть один раз.
-        if (!ReferenceEquals(SortKey.Array, Text.Array))
-            ArrayPool<byte>.Shared.Return(SortKey.Array!);
-        listPool.Return(Values);
+        if (Buffer is not null)
+            NativeMemory.AlignedFree(Buffer);
+        Buffer = null;
     }
 }
 
@@ -121,18 +168,6 @@ sealed class ChunkEntryComparer<T> : IComparer<ReadChunkEntry<T>> where T : IBin
         if (x is null) return y is null ? 0 : -1;
         if (y is null) return 1;
         return x.SortKey.AsSpan().SequenceCompareTo(y.SortKey.AsSpan());
-    }
-}
-
-/// <summary>Политика пула списков чисел: Return очищает список, сохраняя ёмкость для повторного использования.</summary>
-sealed class ListPoolPolicy<T> : IPooledObjectPolicy<List<T>>
-{
-    public List<T> Create() => [];
-
-    public bool Return(List<T> obj)
-    {
-        obj.Clear();
-        return true;
     }
 }
 

@@ -1,16 +1,22 @@
 using System.Buffers;
+using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Globalization;
+using System.IO.Compression;
 using System.IO.Pipelines;
 using System.Numerics;
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading.Tasks.Dataflow;
 using Microsoft.Extensions.ObjectPool;
-using ZstdSharp;
 
 /// <summary>
-/// Фаза разбиения: читает исходный файл, собирает строки в чанки (текст — ключ словаря, числа — списки),
-/// сортирует чанки параллельно (TPL Dataflow) и пишет отсортированные промежуточные файлы с компрессией zstd.
+/// Фаза разбиения: читает исходник, собирает строки в чанки (текст — ключ словаря, числа — списки),
+/// сортирует чанки и пишет отсортированные промежуточные файлы со сжатием zstd.
+/// Конвейер со стадиями наперёд (backpressure приходит только от записи на диск):
+/// чтение выделенным потоком (sync FileStream → Pipe) → разбор строк → сортировка чанков
+/// (TransformBlock) → сериализация + one-shot zstd (TransformBlock) → запись файла (ActionBlock).
 /// </summary>
 class SplitSort<T>(
     FileInfo source,
@@ -19,7 +25,6 @@ class SplitSort<T>(
     int sortParallelism,
     int minChunkMb,
     int maxChunkMb,
-    int flushMb,
     int zstdLevel) where T : IBinaryInteger<T>
 {
     // Граница stackalloc для копий текста строки; больше — аренда из пула, чтобы не переполнить стек.
@@ -37,11 +42,10 @@ class SplitSort<T>(
     readonly bool isUtf8 = encoding.WebName == "utf-8";
     readonly bool isOrdinal = compareOptions == CompareOptions.Ordinal;
     readonly int bufferSize = ComputeBufferSize(source.Length, minChunkMb, maxChunkMb);
-    readonly int flushThreshold = flushMb * 1024 * 1024;
-    // Буфер файлового потока записи — чуть меньше порога сброса PipeWriter,
-    // чтобы данные уходили в файл сквозь двойную буферизацию большими блоками.
-    readonly int writeStreamBufferSize = Math.Clamp(flushMb * 1024 * 1024 - 64 * 1024, 64 * 1024, 32 * 1024 * 1024);
     readonly int zstdLevel = zstdLevel;
+    // Бюджет окна zstd: merge декодирует все чанки одновременно, окно каждого кадра выделяется
+    // декодером целиком — ограничиваем суммарную память (~2ГБ) долей на один чанк.
+    readonly int windowLog2 = ComputeWindowLog2(source.Length, ComputeBufferSize(source.Length, minChunkMb, maxChunkMb));
     readonly ArrayPool<byte> arrayPool = ArrayPool<byte>.Shared;
     readonly ObjectPool<Dictionary<BufferString, KeyInfo>> dictionaryPool = new DefaultObjectPool<Dictionary<BufferString, KeyInfo>>(new LookupPoolPolicy());
 
@@ -49,61 +53,96 @@ class SplitSort<T>(
     private static int ComputeBufferSize(long fileLength, int minChunkMb, int maxChunkMb) =>
         (int)Math.Clamp(fileLength / (Environment.ProcessorCount * 2L), minChunkMb * 1024L * 1024L, maxChunkMb * 1024L * 1024L);
 
+    /// <summary>Логарифм окна zstd: не больше размера чанка и в бюджете ~2ГБ на все параллельные декодеры merge.</summary>
+    private static int ComputeWindowLog2(long fileLength, int chunkBufferBytes)
+    {
+        var chunkCount = Math.Max(1, fileLength / chunkBufferBytes);
+        var perStream = 2L * 1024 * 1024 * 1024 / chunkCount;
+        return Math.Clamp(BitOperations.Log2((uint)Math.Max(1, perStream)), 20, 31);
+    }
+
     /// <summary>
     /// Прогоняет конвейер разбиения и возвращает пути созданных промежуточных файлов (порядок не важен).
-    /// Конвейер: цикл строк (продюсер) → TransformBlock сортировки чанков (параллельно)
-    /// → TransformBlock записи на диск (zstd) → BufferBlock имён файлов.
     /// </summary>
     public async Task<List<FileInfo>> RunAsync(CancellationToken ct)
     {
+        Extensions.Trace("RunAsync begin");
+        var files = new ConcurrentQueue<FileInfo>();
+
         var sorter = new TransformBlock<Chunk<T>, Chunk<T>>(
-            async chunk =>
+            chunk =>
             {
-                await SortChunk(chunk, ct).ConfigureAwait(false);
+                Extensions.Trace($"sort begin: {chunk.KeyCount} keys");
+                SortChunk(chunk, ct);
+                Extensions.Trace("sort end");
                 return chunk;
             },
             new ExecutionDataflowBlockOptions
             {
                 MaxDegreeOfParallelism = sortParallelism,
                 BoundedCapacity = sortParallelism + 2,
+                EnsureOrdered = false,
                 CancellationToken = ct,
             });
-        var saver = new TransformBlock<Chunk<T>, FileInfo>(
-            async chunk =>
+        var compressor = new TransformBlock<Chunk<T>, CompressedChunk>(
+            chunk =>
             {
-                var file = await SaveChunk(chunk, ct).ConfigureAwait(false);
-                chunk.Dispose();
-                return file;
+                Extensions.Trace("compress begin");
+                var r = CompressChunk(chunk);
+                Extensions.Trace($"compress end: {r.Length >> 20}MB");
+                return r;
             },
             new ExecutionDataflowBlockOptions
             {
                 MaxDegreeOfParallelism = 2,
-                BoundedCapacity = sortParallelism + 2,
+                BoundedCapacity = 2,
+                EnsureOrdered = false,
                 CancellationToken = ct,
             });
-        var fileNames = new BufferBlock<FileInfo>(new DataflowBlockOptions { CancellationToken = ct });
-        var sorterToSaver = sorter.LinkTo(saver, new DataflowLinkOptions { PropagateCompletion = true });
-        var saverToNames = saver.LinkTo(fileNames, new DataflowLinkOptions { PropagateCompletion = true });
+        // Последняя стадия — ActionBlock: у него нет выходной очереди, поэтому BoundedCapacity
+        // считает только вход (у TransformBlock непотреблённый выход тоже занимает лимит и
+        // без связанного получателя блокирует стадию после первого чанка).
+        var saver = new ActionBlock<CompressedChunk>(
+            chunk =>
+            {
+                Extensions.Trace($"write begin: {chunk.Length >> 20}MB");
+                WriteChunk(in chunk);
+                chunk.Dispose();
+                files.Enqueue(chunk.File);
+                Extensions.Trace("write end");
+            },
+            new ExecutionDataflowBlockOptions
+            {
+                MaxDegreeOfParallelism = 1,
+                BoundedCapacity = 1,
+                EnsureOrdered = false,
+                CancellationToken = ct,
+            });
+        var sorterToCompressor = sorter.LinkTo(compressor, new DataflowLinkOptions { PropagateCompletion = true });
+        var compressorToSaver = compressor.LinkTo(saver, new DataflowLinkOptions { PropagateCompletion = true });
 
-        // Чтение файла выделенным продюсером через Pipe: FileStream без внутренней буферизации
-        // и с SequentialScan, большие пороги позволяют читателю уходить вперёд на 8-16 МБ.
+        // Чтение исходника выделенным потоком: sync FileStream → Pipe (опережение разбора на 8-16 МБ).
         var pipe = new Pipe(new PipeOptions(
             minimumSegmentSize: 1 << 20,
             pauseWriterThreshold: 16 << 20,
             resumeWriterThreshold: 8 << 20,
             useSynchronizationContext: false));
-
-        using var fileStream = new FileStream(source.FullName, FileMode.Open, FileAccess.Read, FileShare.Read,
-            bufferSize: 0, FileOptions.SequentialScan | FileOptions.Asynchronous);
-        var fill = FillAsync(fileStream, pipe.Writer, readSize: 1 << 20);
+        var fill = Task.Factory.StartNew(() => FillPipe(pipe.Writer, ct), ct, TaskCreationOptions.LongRunning, TaskScheduler.Default);
 
         Exception? loopError = null;
         try
         {
             await foreach (var chunk in SplitToChunks(pipe.Reader.Split(newLine, ct), bufferSize, ct).ConfigureAwait(false))
             {
-                await sorter.SendAsync(chunk, ct).ConfigureAwait(false);
+                Extensions.Trace($"parse: chunk {chunk.KeyCount} keys, used {chunk.Used >> 20}MB → send");
+                if (!await sorter.SendAsync(chunk, ct).ConfigureAwait(false))
+                {
+                    // Конвейер остановился (сбой стадии) — буфер чанка больше никому не нужен.
+                    chunk.Dispose();
+                    break;
+                }
             }
+            Extensions.Trace("parse: done");
         }
         catch (Exception ex)
         {
@@ -114,12 +153,13 @@ class SplitSort<T>(
         try
         {
             await sorter.Completion.ConfigureAwait(false);
+            await compressor.Completion.ConfigureAwait(false);
             await saver.Completion.ConfigureAwait(false);
         }
         finally
         {
-            sorterToSaver.Dispose();
-            saverToNames.Dispose();
+            sorterToCompressor.Dispose();
+            compressorToSaver.Dispose();
         }
 
         try
@@ -135,31 +175,41 @@ class SplitSort<T>(
         if (loopError is not null)
             throw new InvalidOperationException("Failed to split the source file", loopError);
 
-        List<FileInfo> files = [];
-        while (fileNames.TryReceive(out var file))
-            files.Add(file);
-        return files;
+        List<FileInfo> result = [];
+        while (files.TryDequeue(out var file))
+            result.Add(file);
+        return result;
     }
 
-    /// <summary>Продюсер чтения файла: блоками readSize в пайп.</summary>
-    private static async Task FillAsync(Stream source, PipeWriter writer, int readSize)
+    /// <summary>Продюсер чтения файла: sync-чтение блоками readSize в пайп (выделенный поток).</summary>
+    private void FillPipe(PipeWriter writer, CancellationToken ct)
     {
         try
         {
+            Extensions.Trace("read begin");
+            using var fileStream = new FileStream(source.FullName, FileMode.Open, FileAccess.Read, FileShare.Read,
+                bufferSize: 0, FileOptions.SequentialScan);
+            long total = 0;
             while (true)
             {
-                var mem = writer.GetMemory(readSize);
-                int n = await source.ReadAsync(mem).ConfigureAwait(false);
+                ct.ThrowIfCancellationRequested();
+                var span = writer.GetSpan(1 << 20);
+                var n = fileStream.Read(span);
                 if (n == 0) break;
+                total += n;
                 writer.Advance(n);
-                var r = await writer.FlushAsync().ConfigureAwait(false);
+                var r = writer.FlushAsync(ct).AsTask().GetAwaiter().GetResult();
                 if (r.IsCompleted) break;
+                if (total % (32 << 20) < (1 << 20))
+                    Extensions.Trace($"read: {total >> 20}MB");
             }
-            await writer.CompleteAsync().ConfigureAwait(false);
+            Extensions.Trace($"read done: {total >> 20}MB");
+            writer.Complete();
         }
         catch (Exception ex)
         {
-            await writer.CompleteAsync(ex).ConfigureAwait(false);
+            Extensions.Trace($"read failed: {ex.Message}");
+            writer.Complete(ex);
         }
     }
 
@@ -234,7 +284,7 @@ class SplitSort<T>(
     /// параллельно — sort key по ключам и сортировка CSR-диапазонов; порядок записи — по sort key.
     /// Ordinal-режим: sort key не вычисляются, порядок — по байтам текста.
     /// </summary>
-    private async Task SortChunk(Chunk<T> chunk, CancellationToken ct)
+    private void SortChunk(Chunk<T> chunk, CancellationToken ct)
     {
         var keyCount = chunk.KeyCount;
         var maxKeyBytes = chunk.TextLengths.Count > 0 ? chunk.TextLengths.Max() : 0;
@@ -313,62 +363,100 @@ class SplitSort<T>(
         }
         chunk.Order = order;
 
-        // Словарь больше не нужен — возвращаем в пул до записи файла.
+        // Словарь и sort key больше не нужны — освобождаем до сериализации чанка.
         chunk.ReleaseLookup();
+        chunk.ReleaseSortKeys();
     }
 
     /// <summary>
-    /// Пишет отсортированный чанк в промежуточный файл с компрессией zstd (fast). Формат v2,
-    /// все числа — LEB128 varint: varint(длина текста), текст, varint(длина sort key), [sort key],
-    /// varint(количество чисел), varint(первое число), varint(разности)... keyLen == 0 — ordinal-режим.
+    /// Сериализует и сжимает чанк: точный размер по ComputeChunkSize → буфер S, один проход по
+    /// Order (memcpy текстов + varint-заголовки), one-shot zstd S → C. Буфер текстов чанка
+    /// освобождается сразу после сериализации, до сжатия.
     /// </summary>
-    private async Task<FileInfo> SaveChunk(Chunk<T> chunk, CancellationToken ct)
+    private unsafe CompressedChunk CompressChunk(Chunk<T> chunk)
     {
         var index = Interlocked.Increment(ref savedChunkCount) - 1;
         var chunkFile = new FileInfo(Path.ChangeExtension(source.FullName, $".chunk-{index:D3}{Path.GetExtension(source.FullName)}"));
-        using var fileStream = new FileStream(chunkFile.FullName, FileMode.Create, FileAccess.Write, FileShare.None,
-            bufferSize: writeStreamBufferSize, FileOptions.SequentialScan);
-        // Преаллокация точного несжатого размера — файловая система не расширяет файл по кусочкам.
-        fileStream.SetLength(ComputeChunkSize(chunk));
-        fileStream.Seek(0, SeekOrigin.Begin);
-        using var zstdStream = new CompressionStream(fileStream, zstdLevel);
-        var writer = PipeWriter.Create(zstdStream, new StreamPipeWriterOptions(leaveOpen: true));
-        var textOffsets = chunk.TextOffsets!;
-        var values = chunk.Values!;
-        var csr = chunk.CsrOffsets!;
-        foreach (var i in chunk.Order!)
+        byte* s = null;
+        byte* c = null;
+        try
         {
-            var keySpan = chunk.BufferSpan.Slice(textOffsets[i], textOffsets[i + 1] - textOffsets[i]);
-            writer.WriteVarint((ulong)keySpan.Length);
-            writer.Write(keySpan);
-            var start = csr[i];
-            var count = csr[i + 1] - start;
-            writer.WriteVarint((ulong)count);
-            T previous = T.Zero;
-            for (var j = start; j < start + count; j++)
+            var size = ComputeChunkSize(chunk);
+            s = (byte*)NativeMemory.AlignedAlloc((nuint)Math.Max(16, size), 64);
+            SerializeChunk(chunk, new Span<byte>(s, checked((int)size)));
+            chunk.Dispose(); // тексты больше не нужны — освобождаем до сжатия
+
+            var cLength = checked((int)ZstandardEncoder.GetMaxCompressedLength(size));
+            c = (byte*)NativeMemory.AlignedAlloc((nuint)cLength, 64);
+            using var encoder = new ZstandardEncoder(new ZstandardCompressionOptions
             {
-                writer.WriteVarint(ulong.CreateChecked(values[j] - previous));
-                previous = values[j];
-            }
-            if (writer.UnflushedBytes >= flushThreshold)
-                await writer.FlushAsync(ct).ConfigureAwait(false);
+                Quality = zstdLevel,
+                WindowLog2 = Math.Min(windowLog2, Math.Clamp(BitOperations.Log2((uint)size) + 1, 20, 31)),
+                EnableLongDistanceMatching = true,
+            });
+            // Один вызов на весь чанк (isFinalBlock дописывает footer кадра).
+            var status = encoder.Compress(new ReadOnlySpan<byte>(s, checked((int)size)), new Span<byte>(c, cLength),
+                out var consumed, out var written, isFinalBlock: true);
+            if (status != OperationStatus.Done || consumed != size)
+                throw new InvalidOperationException($"zstd compression incomplete: {status}, {consumed} of {size}");
+            NativeMemory.AlignedFree(s);
+            s = null;
+            return new CompressedChunk(chunkFile, c, written);
         }
-        await writer.FlushAsync(ct).ConfigureAwait(false);
-        await writer.CompleteAsync().ConfigureAwait(false);
-        chunk.ReleaseSortKeys();
-        // Dispose zstd-потока дописывает footer кадра; затем обрезаем преаллокацию по факту.
-        zstdStream.Dispose();
-        fileStream.SetLength(fileStream.Position);
-        return chunkFile;
+        catch
+        {
+            if (s is not null) NativeMemory.AlignedFree(s);
+            if (c is not null) NativeMemory.AlignedFree(c);
+            throw;
+        }
     }
     private int savedChunkCount;
 
-    /// <summary>Точный несжатый размер файла чанка до записи — для преаллокации.</summary>
+    /// <summary>
+    /// Сериализует отсортированный чанк (формат v3, все числа — LEB128 varint):
+    /// varint(длина текста), текст, varint(количество чисел), varint(разности чисел) — для каждого
+    /// ключа в порядке Order. Sort key в файл не пишутся — merge пересчитывает их пакетами.
+    /// </summary>
+    private static void SerializeChunk(Chunk<T> chunk, Span<byte> dst)
+    {
+        var textOffsets = chunk.TextOffsets!;
+        var values = chunk.Values!;
+        var csr = chunk.CsrOffsets!;
+        var buffer = chunk.BufferSpan;
+        var pos = 0;
+        foreach (var i in chunk.Order!)
+        {
+            var textLen = textOffsets[i + 1] - textOffsets[i];
+            pos = Extensions.WriteVarint(dst, pos, (ulong)textLen);
+            buffer.Slice(textOffsets[i], textLen).CopyTo(dst.Slice(pos));
+            pos += textLen;
+            var start = csr[i];
+            var count = csr[i + 1] - start;
+            pos = Extensions.WriteVarint(dst, pos, (ulong)count);
+            T previous = T.Zero;
+            for (var j = start; j < start + count; j++)
+            {
+                pos = Extensions.WriteVarint(dst, pos, ulong.CreateChecked(values[j] - previous));
+                previous = values[j];
+            }
+        }
+        if (pos != dst.Length)
+            throw new InvalidOperationException($"Chunk serialized size mismatch: {pos} != {dst.Length}");
+    }
+
+    /// <summary>Пишет сжатый чанк на диск одним Write (преаллокация точного размера — без расширения по кусочкам).</summary>
+    private static unsafe void WriteChunk(in CompressedChunk chunk)
+    {
+        using var fileStream = new FileStream(chunk.File.FullName, FileMode.Create, FileAccess.Write, FileShare.None,
+            bufferSize: 0, FileOptions.SequentialScan);
+        fileStream.SetLength(chunk.Length);
+        fileStream.Write(new ReadOnlySpan<byte>(chunk.Buffer, chunk.Length));
+    }
+
+    /// <summary>Точный несжатый размер файла чанка до сериализации — для аллокации буфера S.</summary>
     private static long ComputeChunkSize(Chunk<T> chunk)
     {
         var textOffsets = chunk.TextOffsets!;
-        var sortKeyOffsets = chunk.SortKeyOffsets; // null в ordinal-режиме
-        var sortKeyLengths = chunk.SortKeyLengths;
         var csr = chunk.CsrOffsets!;
         var values = chunk.Values!;
         long total = 0;
@@ -389,4 +477,6 @@ class SplitSort<T>(
     }
 
     private static int VarintSize(ulong value) => 1 + (int)(BitOperations.Log2(value | 1) / 7);
+
+    // Трассировка стадий конвейера (stderr) — включается переменной окружения HFS_TRACE=1.
 }
