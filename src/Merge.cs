@@ -23,7 +23,7 @@ class Merge<T>(FileInfo destination, Encoding encoding, int flushMb, CompareOpti
     readonly int prefetch = prefetch;
     readonly long? preallocatedLength = preallocatedLength;
     // Буфер файлового потока записи — чуть меньше порога сброса PipeWriter.
-    readonly int writeStreamBufferSize = Math.Clamp(flushMb * 1024 * 1024 - 64 * 1024, 64 * 1024, 1024 * 1024);
+    readonly int writeStreamBufferSize = Math.Clamp(flushMb * 1024 * 1024 - 64 * 1024, 64 * 1024, 32 * 1024 * 1024);
 
 
     /// <summary>
@@ -57,7 +57,7 @@ class Merge<T>(FileInfo destination, Encoding encoding, int flushMb, CompareOpti
             {
                 try
                 {
-                    await using var stream = new DecompressionStream(file.OpenRead(), leaveOpen: false);
+                    await using var stream = new DecompressionStream(new FileStream(file.FullName, FileMode.Open, FileAccess.Read, FileShare.Read, bufferSize: 4 << 20, FileOptions.SequentialScan | FileOptions.Asynchronous), leaveOpen: false);
                     await foreach (var entry in stream.ReadChunkEntries<T>(encoding, compareInfo, compareOptions, ct)
                                        .ConfigureAwait(false))
                     {

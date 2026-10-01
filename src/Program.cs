@@ -38,8 +38,8 @@ internal partial class RootCliCommand
         [CliOption(Name = "max-chunk-mb", Description = "Upper bound of the adaptive chunk buffer, MB (default: 500)")]
         public int MaxChunkMb { get; set; } = 500;
 
-        [CliOption(Name = "flush-mb", Description = "Unflushed bytes threshold for the output writer, MB (default: 1)")]
-        public int FlushMb { get; set; } = 1;
+        [CliOption(Name = "flush-mb", Description = "Unflushed bytes threshold for the output writer, MB (default: 32)")]
+        public int FlushMb { get; set; } = 32;
 
         [CliOption(Name = "zstd-level", Description = "Zstd compression level for chunk files (default: 6)")]
         public int ZstdLevel { get; set; } = 6;
@@ -96,8 +96,8 @@ internal partial class RootCliCommand
         [CliOption(Name = "max-chunk-mb", Description = "Upper bound of the adaptive chunk buffer, MB (default: 500)")]
         public int MaxChunkMb { get; set; } = 500;
 
-        [CliOption(Name = "flush-mb", Description = "Unflushed bytes threshold for the chunk writer, MB (default: 1)")]
-        public int FlushMb { get; set; } = 1;
+        [CliOption(Name = "flush-mb", Description = "Unflushed bytes threshold for the chunk writer, MB (default: 32)")]
+        public int FlushMb { get; set; } = 32;
 
         [CliOption(Name = "zstd-level", Description = "Zstd compression level for chunk files (default: 6)")]
         public int ZstdLevel { get; set; } = 6;
@@ -120,8 +120,8 @@ internal partial class RootCliCommand
             ValidationRules = CliValidationRules.LegalPath)]
         public FileInfo Destination { get; set; } = null!;
 
-        [CliOption(Name = "flush-mb", Description = "Unflushed bytes threshold for the output writer, MB (default: 1)")]
-        public int FlushMb { get; set; } = 1;
+        [CliOption(Name = "flush-mb", Description = "Unflushed bytes threshold for the output writer, MB (default: 32)")]
+        public int FlushMb { get; set; } = 32;
 
         [CliOption(Name = "compare-options", Description = "Text comparison used at split: None (default), Ordinal, IgnoreCase, IgnoreNonSpace, IgnoreSymbols, or a combination")]
         public string CompareOptionsName { get; set; } = "None";

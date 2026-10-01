@@ -40,7 +40,7 @@ class SplitSort<T>(
     readonly int flushThreshold = flushMb * 1024 * 1024;
     // Буфер файлового потока записи — чуть меньше порога сброса PipeWriter,
     // чтобы данные уходили в файл сквозь двойную буферизацию большими блоками.
-    readonly int writeStreamBufferSize = Math.Clamp(flushMb * 1024 * 1024 - 64 * 1024, 64 * 1024, 1024 * 1024);
+    readonly int writeStreamBufferSize = Math.Clamp(flushMb * 1024 * 1024 - 64 * 1024, 64 * 1024, 32 * 1024 * 1024);
     readonly int zstdLevel = zstdLevel;
     readonly ArrayPool<byte> arrayPool = ArrayPool<byte>.Shared;
     readonly ObjectPool<Dictionary<BufferString, KeyInfo>> dictionaryPool = new DefaultObjectPool<Dictionary<BufferString, KeyInfo>>(new LookupPoolPolicy());
