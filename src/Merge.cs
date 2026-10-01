@@ -51,7 +51,7 @@ class Merge<T>(FileInfo destination, Encoding encoding, int flushMb, CompareOpti
         for (var i = 0; i < chunkFiles.Count; i++)
         {
             var file = chunkFiles[i];
-            var channel = Channel.CreateBounded<Batch<T>>(new BoundedChannelOptions(1) { SingleWriter = true, SingleReader = true });
+            var channel = Channel.CreateBounded<Batch<T>>(new BoundedChannelOptions(2) { SingleWriter = true, SingleReader = true });
             channels[i] = channel;
             producers[i] = ProduceChunk(file, channel, cpuSlots, ct);
         }
@@ -109,7 +109,7 @@ class Merge<T>(FileInfo destination, Encoding encoding, int flushMb, CompareOpti
         try
         {
             var fileStream = new FileStream(file.FullName, FileMode.Open, FileAccess.Read, FileShare.Read,
-                bufferSize: 1 << 20, FileOptions.SequentialScan | FileOptions.Asynchronous);
+                bufferSize: 4 << 20, FileOptions.SequentialScan | FileOptions.Asynchronous);
             // Окно сжатия чанков доходит до 2^31 — разрешаем декодеру столько же.
             await using var zstd = new ZstandardStream(fileStream,
                 new ZstandardDecompressionOptions { MaxWindowLog2 = 31 }, leaveOpen: false);

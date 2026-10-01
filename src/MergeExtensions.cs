@@ -11,12 +11,11 @@ static class MergeExtensions
     private const int StackallocCharThreshold = 8 * 1024;
 
     /// <summary>
-    /// Продюсер чанка при merge: читает сжатый файл через декомпрессионный поток, собирает записи
-    /// в пакеты (тексты — zero-copy в общем буфере пакета, значения — общий массив), вычисляет
-    /// sort key всех записей пакета под глобальным CPU-слотом и кладёт пакеты в канал.
-    /// Владеет stream: закрывает его при любом исходе. Владение буфером переходит к пакету.
+    /// Продюсер чанка при merge: читатель и вычислитель работают параллельно — читатель наполняет
+    /// буферы из декомпрессионного потока, не дожидаясь CPU, вычислитель считает sort key пакета
+    /// под глобальным CPU-слотом. Буфер с текстами записей переходит во владение пакету.
     /// </summary>
-    public static async Task ProduceBatches<T>(
+    public static Task ProduceBatches<T>(
         this Stream stream,
         ChannelWriter<Batch<T>> channel,
         Encoding encoding,
@@ -27,70 +26,135 @@ static class MergeExtensions
         string label,
         CancellationToken ct) where T : IBinaryInteger<T>
     {
-        var buffer = ArrayPool<byte>.Shared.Rent(batchBytes);
-        var start = 0; // начало неразобранных данных (хвост незавершённой записи)
-        var end = 0;   // конец данных в буфере
-        long entriesProduced = 0;
+        var buffers = Channel.CreateBounded<(byte[] Buffer, int Filled, bool Eof)>(
+            new BoundedChannelOptions(1) { SingleWriter = true, SingleReader = true });
+        return Task.WhenAll(
+            ReadChunks(stream, buffers.Writer, batchBytes, ct),
+            ComputeBatches<T>(buffers.Reader, channel, encoding, compareInfo, compareOptions, cpuSlots, batchBytes, label, ct));
+    }
+
+    /// <summary>Читатель: наполняет буферы до конца (или eof) и передаёт вычислителю.</summary>
+    private static async Task ReadChunks(
+        Stream stream,
+        ChannelWriter<(byte[] Buffer, int Filled, bool Eof)> buffers,
+        int batchBytes,
+        CancellationToken ct)
+    {
         try
         {
             while (true)
             {
-                // Дозаполняем буфер после хвоста незавершённой записи.
+                var buffer = ArrayPool<byte>.Shared.Rent(batchBytes);
+                int filled = 0;
                 var eof = false;
-                while (end < buffer.Length)
+                while (filled < buffer.Length)
                 {
-                    var n = await stream.ReadAsync(buffer.AsMemory(end), ct).ConfigureAwait(false);
+                    var n = await stream.ReadAsync(buffer.AsMemory(filled), ct).ConfigureAwait(false);
                     if (n == 0)
                     {
                         eof = true;
                         break;
                     }
-                    end += n;
+                    filled += n;
                 }
-                if (end == start)
+                await buffers.WriteAsync((buffer, filled, eof), ct).ConfigureAwait(false);
+                if (eof)
+                {
+                    buffers.TryComplete();
+                    return;
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            buffers.TryComplete(ex);
+            throw;
+        }
+        finally
+        {
+            await stream.DisposeAsync().ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>Вычислитель: разбирает порции в пакеты под CPU-слотом и кладёт в выходной канал.</summary>
+    private static async Task ComputeBatches<T>(
+        ChannelReader<(byte[] Buffer, int Filled, bool Eof)> buffers,
+        ChannelWriter<Batch<T>> channel,
+        Encoding encoding,
+        CompareInfo compareInfo,
+        CompareOptions compareOptions,
+        SemaphoreSlim cpuSlots,
+        int batchBytes,
+        string label,
+        CancellationToken ct) where T : IBinaryInteger<T>
+    {
+        byte[]? pending = null; // хвост незавершённой записи прошлой порции
+        var pendingLen = 0;
+        long entriesProduced = 0;
+        try
+        {
+            while (true)
+            {
+                var (buffer, filled, eof) = await buffers.ReadAsync(ct).ConfigureAwait(false);
+                if (filled == 0)
                 {
                     ArrayPool<byte>.Shared.Return(buffer);
-                    break; // EOF и хвоста нет
+                    break; // конец потока
                 }
 
-                int consumed;
+                byte[] batchBuffer;
+                if (pending is null)
+                {
+                    batchBuffer = buffer; // разбор на месте, буфер уходит пакету
+                }
+                else
+                {
+                    // Хвост прошлой порции + новые данные в свежий буфер — записи ссылаются на него.
+                    batchBuffer = ArrayPool<byte>.Shared.Rent(pendingLen + filled);
+                    Buffer.BlockCopy(pending, 0, batchBuffer, 0, pendingLen);
+                    Buffer.BlockCopy(buffer, 0, batchBuffer, pendingLen, filled);
+                    ArrayPool<byte>.Shared.Return(buffer);
+                }
+                var end = pendingLen + filled;
+
                 Batch<T> batch;
+                int consumed;
                 await cpuSlots.WaitAsync(ct).ConfigureAwait(false);
                 try
                 {
-                    batch = ParseBatch<T>(buffer, start, end, encoding, compareInfo, compareOptions, eof, out consumed);
+                    batch = ParseBatch<T>(batchBuffer, 0, end, encoding, compareInfo, compareOptions, eof, out consumed);
                 }
                 catch
                 {
-                    ArrayPool<byte>.Shared.Return(buffer);
+                    ArrayPool<byte>.Shared.Return(batchBuffer);
                     throw;
                 }
                 finally
                 {
                     cpuSlots.Release();
                 }
-                start = consumed;
-                entriesProduced += batch.Entries.Length;
 
-                // Старый буфер (с текстами записей) уходит во владение пакету; продолжаем со свежим.
-                if (start != end)
+                // Хвост незавершённой записи — в отдельный буфер; batchBuffer уходит пакету.
+                var tail = end - consumed;
+                var oldPending = pending;
+                if (tail > 0)
                 {
-                    // Хвост незавершённой записи — в начало нового буфера.
-                    var fresh = ArrayPool<byte>.Shared.Rent(batchBytes);
-                    Buffer.BlockCopy(buffer, start, fresh, 0, end - start);
-                    end -= start;
-                    start = 0;
-                    buffer = fresh;
+                    pending = ArrayPool<byte>.Shared.Rent(tail);
+                    Buffer.BlockCopy(batchBuffer, consumed, pending, 0, tail);
+                    pendingLen = tail;
                 }
                 else
                 {
-                    start = 0;
-                    end = 0;
-                    buffer = ArrayPool<byte>.Shared.Rent(batchBytes);
+                    pending = null;
+                    pendingLen = 0;
                 }
+                if (oldPending is not null)
+                    ArrayPool<byte>.Shared.Return(oldPending);
+
+                entriesProduced += batch.Entries.Length;
                 await channel.WriteAsync(batch, ct).ConfigureAwait(false);
                 if (eof)
-                    break; // при eof ParseBatch гарантирует start == end
+                    break; // eof-порция обработана — данных больше не будет
             }
             Extensions.Trace($"[{label}] produced {entriesProduced} entries");
             channel.TryComplete();
@@ -99,10 +163,6 @@ static class MergeExtensions
         {
             channel.TryComplete(ex);
             throw;
-        }
-        finally
-        {
-            await stream.DisposeAsync().ConfigureAwait(false);
         }
     }
 
