@@ -10,7 +10,6 @@ using System.Text;
 using System.Threading.Tasks.Dataflow;
 using DotMake.CommandLine;
 using Microsoft.Extensions.ObjectPool;
-using System.Linq;
 using System.Threading.Channels;
 
 /// <summary>
@@ -77,12 +76,20 @@ internal partial class SplitCliCommand
 
     /// <summary>Запускает конвейер разбиения с готовыми настройками; используется и командой sort.</summary>
     internal async Task SplitAsync(
-        Encoding encoding, 
-        CompareOptions compareOptions, 
+        Encoding encoding,
+        CompareOptions compareOptions,
         ChannelWriter<FileInfo> files,
         CancellationToken ct)
     {
-        Initialize(encoding, compareOptions);
+        this.encoding = encoding;
+        this.compareOptions = compareOptions;
+        compareInfo = CultureInfo.CurrentCulture.CompareInfo;
+        isUtf8 = encoding.WebName == "utf-8";
+        isOrdinal = compareOptions == CompareOptions.Ordinal;
+        newLine = encoding.GetBytes(Environment.NewLine);
+        dotSpace = encoding.GetBytes(". ");
+        bufferSize = ComputeBufferSize(Source.Length, MinChunkMb, MaxChunkMb);
+        windowLog2 = ComputeWindowLog2(Source.Length, bufferSize);
 
         TransformBlock<Chunk, Chunk> sorter = new(
             chunk =>
@@ -131,34 +138,23 @@ internal partial class SplitCliCommand
             useSynchronizationContext: false));
         var fill = Task.Factory.StartNew(() => FillPipe(pipe.Writer, ct), ct, TaskCreationOptions.LongRunning, TaskScheduler.Default);
 
-        var lines = pipe.Reader.Split(newLine, ct);
-        var completed = await SplitToChunks(lines, bufferSize, ct)
-            .AllAsync(async (c, ct) => await sorter.SendAsync(c, ct), ct)
-            .ConfigureAwait(false);
-        if(!completed)
+        try
         {
-            throw new InvalidOperationException();
+            var lines = pipe.Reader.Split(newLine, ct);
+            var completed = await SplitToChunks(lines, bufferSize, ct)
+                .AllAsync((c, ct) => new ValueTask<bool>(sorter.SendAsync(c, ct)), ct)
+                .ConfigureAwait(false);
+            if (!completed)
+                throw new InvalidOperationException("Sorter stopped accepting chunks (pipeline faulted)");
+            sorter.Complete();
+            await Task.WhenAll(fill, sorter.Completion, compressor.Completion, saver.Completion);
         }
-        sorter.Complete();
-        await Task.WhenAll(fill, sorter.Completion, compressor.Completion, saver.Completion);
-        files.Complete();
-    }
-
-    /// <summary>
-    /// Инициализирует состояние конвейера из опций команды и настроек кодировки/сравнения.
-    /// Вызывается перед каждым прогоном (и командой probe-split — без запуска конвейера).
-    /// </summary>
-    internal void Initialize(Encoding encoding, CompareOptions compareOptions)
-    {
-        this.encoding = encoding;
-        this.compareOptions = compareOptions;
-        compareInfo = CultureInfo.CurrentCulture.CompareInfo;
-        isUtf8 = encoding.WebName == "utf-8";
-        isOrdinal = compareOptions == CompareOptions.Ordinal;
-        newLine = encoding.GetBytes(Environment.NewLine);
-        dotSpace = encoding.GetBytes(". ");
-        bufferSize = ComputeBufferSize(Source.Length, MinChunkMb, MaxChunkMb);
-        windowLog2 = ComputeWindowLog2(Source.Length, bufferSize);
+        finally
+        {
+            // Любая ошибка конвейера доводится до верхнего уровня: потребители канала
+            // дочитывают уже записанные файлы и выходят, исключение уходит через await задачи.
+            files.TryComplete();
+        }
     }
 
     /// <summary>Адаптивный буфер чанка: большой файл — крупные чанки (меньше накладных расходов merge), маленький — мелкие (больше параллелизма).</summary>
@@ -192,10 +188,10 @@ internal partial class SplitCliCommand
                 var n = fileStream.Read(span);
                 if (n == 0) break;
                 writer.Advance(n);
-                var r = writer.FlushAsync(ct);
-                while (!r.IsCompleted) Thread.Yield();
-                
-                if (r.Result.IsCompleted) break;
+                // Синхронное завершение — забираем результат без Task; иначе блокируем выделенный поток.
+                var vt = writer.FlushAsync(ct);
+                FlushResult r = vt.IsCompleted ? vt.Result : vt.AsTask().GetAwaiter().GetResult();
+                if (r.IsCompleted) break;
             }
             writer.Complete();
         }
@@ -340,18 +336,14 @@ internal partial class SplitCliCommand
         // Порядок записи: номера ключей по возрастанию sort key (ordinal — по байтам текста).
         var order = Enumerable.Range(0, keyCount).ToArray();
         var indices = new BufferString[keyCount];
+        for (var i = 0; i < keyCount; i++)
+            indices[i] = isOrdinal
+                ? new BufferString(textOffsets[i], textOffsets[i + 1] - textOffsets[i])
+                : new BufferString(sortKeyOffsets[i], sortKeyLengths[i]);
         if (isOrdinal)
-        {
-            for (var i = 0; i < keyCount; i++)
-                indices[i] = new (textOffsets[i], textOffsets[i + 1] - textOffsets[i]);
             Array.Sort(indices, order, chunk.Comparer);
-        }
         else
-        {
-            for (var i = 0; i < keyCount; i++)
-                indices[i] = new (sortKeyOffsets[i], sortKeyLengths[i]);
             Array.Sort(indices, order, chunk.CreateSortKeyComparer());
-        }
         chunk.Order = order;
 
         // Словарь и sort key больше не нужны — освобождаем до сериализации чанка.
@@ -382,12 +374,7 @@ internal partial class SplitCliCommand
             using ZstandardEncoder encoder = new(new ZstandardCompressionOptions
             {
                 Quality = ZstdLevel,
-#if NET10_0
-                // Backport .NET 11.0.4: свойство переименовано из WindowLog2 в WindowLog.
                 WindowLog = Math.Min(windowLog2, Math.Clamp(BitOperations.Log2((uint)size) + 1, 20, 31)),
-#else
-                WindowLog2 = Math.Min(windowLog2, Math.Clamp(BitOperations.Log2((uint)size) + 1, 20, 31)),
-#endif
                 EnableLongDistanceMatching = true,
             });
             // Один вызов на весь чанк (isFinalBlock дописывает footer кадра).

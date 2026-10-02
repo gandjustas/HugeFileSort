@@ -1,7 +1,6 @@
 using System.Buffers;
 using System.Numerics;
 using System.Runtime.CompilerServices;
-using System.Runtime.InteropServices;
 
 static class Extensions
 {
@@ -13,21 +12,6 @@ static class Extensions
             var destination = writer.GetSpan(value.Length);
             value.CopyTo(destination);
             writer.Advance(value.Length);
-        }
-
-        /// <summary>Пишет число в формате LEB128 varint: 7 бит на байт, старший бит — флаг продолжения.</summary>
-        public void WriteVarint(ulong value)
-        {
-            var size = 1 + (int)(BitOperations.Log2(value | 1) / 7);
-            var destination = writer.GetSpan(size);
-            var i = 0;
-            while (value >= 0x80)
-            {
-                destination[i++] = (byte)(value | 0x80);
-                value >>= 7;
-            }
-            destination[i] = (byte)value;
-            writer.Advance(i + 1);
         }
     }
 

@@ -70,59 +70,39 @@ internal partial class MergeCliCommand
 
         // Продюсеры чанков: sort key пакетов считаются под глобальным CPU-слотом (=ProcessorCount),
         // чтобы суммарная CPU-работа не порождала больше активных потоков, чем ядер.
+        // Ошибки продюсеров приходят в цикл merge через завершение их каналов с исключением.
         SemaphoreSlim cpuSlots = new(Environment.ProcessorCount);
         Channel<Batch>[] channels = new Channel<Batch>[chunkFiles.Count];
-        Task[] producers = new Task[chunkFiles.Count];
         for (var i = 0; i < chunkFiles.Count; i++)
         {
-            var file = chunkFiles[i];
             Channel<Batch> channel = Channel.CreateBounded<Batch>(new BoundedChannelOptions(2) { SingleWriter = true, SingleReader = true });
             channels[i] = channel;
-            producers[i] = ProduceChunk(file, channel, cpuSlots, encoding, compareOptions, ct);
+            // Fire-and-forget: ошибки продюсера приходят в цикл merge через канал.
+            _ = ProduceChunk(chunkFiles[i], channel, cpuSlots, encoding, compareOptions, ct);
         }
 
-        Exception? mergeError = null;
-        try
+        var sources = channels.Select(c => MergeExtensions.ReadEntries(c.Reader, ct));
+        var number = new char[32];
+        var writer = pipe.Writer;
+        await foreach (var group in sources.MergeSorted(ChunkEntryComparer.Instance, MergeGroup, ct).WithCancellation(ct).ConfigureAwait(false))
         {
-            var sources = channels.Select(c => MergeExtensions.ReadEntries(c.Reader, ct));
-            var number = new char[32];
-            var writer = pipe.Writer;
-            await foreach (var group in sources.MergeSorted(ChunkEntryComparer.Instance, MergeGroup, ct).WithCancellation(ct).ConfigureAwait(false))
+            foreach (var (value, text) in group)
             {
-                foreach (var (value, text) in group)
-                {
-                    value.TryFormat(number, out var digits, null, null);
-                    encoding.GetBytes(number.AsSpan(0, digits), writer);
-                    writer.Write(dotSpace);
-                    writer.Write(text.AsSpan());
-                    writer.Write(newLine);
-                }
-                if (writer.UnflushedBytes >= flushThreshold)
-                    await writer.FlushAsync(ct).ConfigureAwait(false);
+                value.TryFormat(number, out var digits, null, null);
+                encoding.GetBytes(number.AsSpan(0, digits), writer);
+                writer.Write(dotSpace);
+                writer.Write(text.AsSpan());
+                writer.Write(newLine);
             }
-            await writer.FlushAsync(ct).ConfigureAwait(false);
+            if (writer.UnflushedBytes >= flushThreshold)
+                await writer.FlushAsync(ct).ConfigureAwait(false);
         }
-        catch (Exception ex)
-        {
-            mergeError = ex;
-        }
-        finally
-        {
-            await pipe.Writer.CompleteAsync().ConfigureAwait(false);
-            try
-            {
-                await drainer.ConfigureAwait(false);
-                // Обрезаем преаллокацию по фактическому размеру.
-                if (PreallocatedLength is not null)
-                    output.SetLength(output.Position);
-            }
-            catch (Exception ex)
-            {
-                mergeError ??= ex;
-            }
-        }
-        if (mergeError is not null)
-            throw mergeError;
+        await writer.FlushAsync(ct).ConfigureAwait(false);
+        await pipe.Writer.CompleteAsync().ConfigureAwait(false);
+        await drainer.ConfigureAwait(false);
+        // Обрезаем преаллокацию по фактическому размеру.
+        if (PreallocatedLength is not null)
+            output.SetLength(output.Position);
         Console.WriteLine($"Merged: {Destination.FullName}");
         Console.WriteLine(sw.Elapsed);
     }
@@ -134,14 +114,9 @@ internal partial class MergeCliCommand
         {
             FileStream fileStream = new(file.FullName, FileMode.Open, FileAccess.Read, FileShare.Read,
                 bufferSize: 4 << 20, FileOptions.SequentialScan | FileOptions.Asynchronous);
-#if NET10_0
-            // Backport .NET 11.0.4: ZstandardDecompressionOptions нет — лимит окна задаёт декодер.
+            // Окно сжатия чанков ограничено бюджетом (~2ГБ на все параллельные декодеры) —
+            // лимит задаёт декодер.
             await using ZstandardStream zstd = new(fileStream, new ZstandardDecoder(31), leaveOpen: false);
-#else
-            // Окно сжатия чанков ограничено бюджетом (до 2^31) — разрешаем декодеру столько же.
-            await using var zstd = new ZstandardStream(fileStream,
-                new ZstandardDecompressionOptions { MaxWindowLog2 = 31 }, leaveOpen: false);
-#endif
             await zstd.ProduceBatches(channel.Writer, encoding, CultureInfo.CurrentCulture.CompareInfo,
                 compareOptions, cpuSlots, BatchBytes, ct).ConfigureAwait(false);
         }
@@ -159,7 +134,9 @@ internal partial class MergeCliCommand
         {
             while (true)
             {
-                var result = reader.ReadAsync(ct).AsTask().GetAwaiter().GetResult();
+                // Синхронное завершение — забираем результат без Task; иначе блокируем выделенный поток.
+                var vt = reader.ReadAsync(ct);
+                ReadResult result = vt.IsCompleted ? vt.Result : vt.AsTask().GetAwaiter().GetResult();
                 var buffer = result.Buffer;
                 foreach (var segment in buffer)
                     output.Write(segment.Span);

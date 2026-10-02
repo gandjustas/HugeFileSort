@@ -86,7 +86,7 @@ sealed class ReadChunkEntry(
     ArraySegment<byte> sortKey,
     long[] values,
     int valuesStart,
-    int valuesCount)
+    int valuesCount) : IDisposable
 {
     /// <summary>Байты текста в кодировке файла.</summary>
     public ArraySegment<byte> Text { get; } = text;
@@ -200,8 +200,6 @@ sealed unsafe class Chunk : IDisposable
         comparer.Bind(buffer, bufferLength);
         alt = lookup.GetAlternateLookup<ReadOnlySpan<byte>>();
     }
-    // Один dictionaryPool.Get() на все три поля: comparer и alternate lookup обязаны
-    // принадлежать тому же словарю, что и lookup.
     private readonly Dictionary<BufferString, KeyInfo> lookup;
     private readonly BytesComparer comparer;
     private readonly Dictionary<BufferString, KeyInfo>.AlternateLookup<ReadOnlySpan<byte>> alt;
@@ -223,9 +221,6 @@ sealed unsafe class Chunk : IDisposable
 
     /// <summary>Ключи, упорядоченные по строковому сравнению; заполняется фазой сортировки.</summary>
     public int[]? Order { get; internal set; }
-
-    /// <summary>Байт занято под ключи в буфере чанка.</summary>
-    public int Used => comparer.Offset;
 
     /// <summary>CSR-массив значений после finalize.</summary>
     public long[]? Values { get; internal set; }
@@ -269,9 +264,6 @@ sealed unsafe class Chunk : IDisposable
         return values;
     }
 
-    /// <summary>Срез нативного буфера текстов.</summary>
-    public unsafe Span<byte> GetTextSlice(int offset, int length) => new(buffer + offset, length);
-
     /// <summary>Срез нативного буфера sort key.</summary>
     public unsafe Span<byte> GetSortKeySlice(int offset, int length) => new(sortKeyBuffer + offset, length);
 
@@ -284,10 +276,6 @@ sealed unsafe class Chunk : IDisposable
         sortKeyBuffer = (byte*)NativeMemory.AlignedAlloc((nuint)Math.Max(16, totalLength), 64);
         sortKeyLength = totalLength;
     }
-
-    public unsafe Span<byte> SortKeySpan => new(sortKeyBuffer, sortKeyLength);
-
-    public unsafe Span<byte> SortKeySpanFrom(int offset) => new(sortKeyBuffer + offset, sortKeyLength - offset);
 
     /// <summary>
     /// Добавляет строку: текст (уже скопирован в буфер чанка) и значение.

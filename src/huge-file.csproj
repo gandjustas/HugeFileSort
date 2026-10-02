@@ -2,22 +2,17 @@
 
   <PropertyGroup>
     <OutputType>Exe</OutputType>
-    <TargetFrameworks>net10.0<!--;net11.0--></TargetFrameworks>
+    <!-- net11 вернём после GA: inbox-zstd + runtime-async. -->
+    <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
-    <!-- Preview-фичи и runtime-async (async2) — только на net11: в net10 флага компилятора нет. -->
-    <EnablePreviewFeatures Condition="'$(TargetFramework)' == 'net11.0'">true</EnablePreviewFeatures>
-    <Features Condition="'$(TargetFramework)' == 'net11.0' AND '$(RuntimeAsync)' != 'false'">$(Features);runtime-async=on</Features>
   </PropertyGroup>
 
-  <ItemGroup Condition="'$(TargetFramework)' == 'net10.0'">
-    <!-- BCL-zstd из .NET 11 на net10: backport с теми же типами System.IO.Compression.Zstandard*. -->
-    <PackageReference Include="SystemIOCompression.Zstandard.Backporting" />
-  </ItemGroup>
-
   <ItemGroup>
+    <!-- zstd из BCL .NET 11; до GA net11 — backport с теми же типами System.IO.Compression.Zstandard*. -->
+    <PackageReference Include="SystemIOCompression.Zstandard.Backporting" />
     <PackageReference Include="Microsoft.Extensions.ObjectPool" />
     <PackageReference Include="DotMake.CommandLine" />
     <PackageReference Include="System.IO.Hashing" />
