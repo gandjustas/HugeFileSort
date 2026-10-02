@@ -6,11 +6,6 @@
   <ItemGroup>
     <PackageVersion Include="BenchmarkDotNet" Version="0.15.8" />
     <PackageVersion Include="Microsoft.Extensions.ObjectPool" Version="10.0.12" />
-    <PackageVersion Include="MessagePack" Version="3.1.10" />
-    <PackageVersion Include="MessagePackAnalyzer" Version="3.1.10">
-      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
-      <PrivateAssets>all</PrivateAssets>
-    </PackageVersion>
     <PackageVersion Include="DotMake.CommandLine" Version="3.7.0" />
     <PackageVersion Include="System.IO.Hashing" Version="10.0.3" />
   </ItemGroup>

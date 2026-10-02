@@ -1,6 +1,5 @@
 using System.Buffers;
 using System.Globalization;
-using System.Numerics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -81,13 +80,13 @@ sealed unsafe class NativeSegmentComparer(byte* buffer) : IComparer<BufferString
 /// значения — срез общего массива значений пакета. Dispose уменьшает счётчик пакета: последний
 /// возврат возвращает буферы пакета в пулы (MergeSorted делает это после потребления группы).
 /// </summary>
-sealed class ReadChunkEntry<T>(
-    Batch<T> batch,
+sealed class ReadChunkEntry(
+    Batch batch,
     ArraySegment<byte> text,
     ArraySegment<byte> sortKey,
-    T[] values,
+    long[] values,
     int valuesStart,
-    int valuesCount) where T : IBinaryInteger<T>
+    int valuesCount)
 {
     /// <summary>Байты текста в кодировке файла.</summary>
     public ArraySegment<byte> Text { get; } = text;
@@ -96,7 +95,7 @@ sealed class ReadChunkEntry<T>(
     public ArraySegment<byte> SortKey { get; } = sortKey;
 
     /// <summary>Общий массив значений пакета (срез — по ValuesStart/ValuesCount).</summary>
-    public T[] ValuesArray { get; } = values;
+    public long[] ValuesArray { get; } = values;
 
     public int ValuesStart { get; } = valuesStart;
 
@@ -111,15 +110,15 @@ sealed class ReadChunkEntry<T>(
 /// Пакет живёт, пока merge не потребит все записи: каждая ReadChunkEntry.Dispose уменьшает
 /// счётчик, последний возвращает массивы в пулы.
 /// </summary>
-sealed class Batch<T>(byte[] buffer, byte[]? sortKeyBuffer, T[] values, int entryCount) where T : IBinaryInteger<T>
+sealed class Batch(byte[] buffer, byte[]? sortKeyBuffer, long[] values, int entryCount)
 {
     private readonly byte[] buffer = buffer;
     private readonly byte[]? sortKeyBuffer = sortKeyBuffer;
-    private readonly T[] values = values;
+    private readonly long[] values = values;
     private int remaining = entryCount;
 
     /// <summary>Записи пакета; заполняется после создания пакета.</summary>
-    public ReadChunkEntry<T>[] Entries { get; set; } = [];
+    public ReadChunkEntry[] Entries { get; set; } = [];
 
     /// <summary>Вызывается при потреблении очередной записи; последний возврат — буферы в пулы.</summary>
     public void Release()
@@ -159,11 +158,11 @@ unsafe struct CompressedChunk : IDisposable
 }
 
 /// <summary>Сравнивает записи промежуточных файлов только по sort key (побайтово).</summary>
-sealed class ChunkEntryComparer<T> : IComparer<ReadChunkEntry<T>> where T : IBinaryInteger<T>
+sealed class ChunkEntryComparer : IComparer<ReadChunkEntry>
 {
-    public static readonly ChunkEntryComparer<T> Instance = new();
+    public static readonly ChunkEntryComparer Instance = new();
 
-    public int Compare(ReadChunkEntry<T>? x, ReadChunkEntry<T>? y)
+    public int Compare(ReadChunkEntry? x, ReadChunkEntry? y)
     {
         if (x is null) return y is null ? 0 : -1;
         if (y is null) return 1;
@@ -189,7 +188,7 @@ sealed class LookupPoolPolicy : IPooledObjectPolicy<Dictionary<BufferString, Key
 /// после finalize — нативный буфер sort key, CSR-массив значений и порядок записи.
 /// Dispose освобождает нативную память, массивы — GC.
 /// </summary>
-sealed unsafe class Chunk<T> : IDisposable where T : IBinaryInteger<T>
+sealed unsafe class Chunk : IDisposable
 {
     private readonly byte* buffer;
     private readonly int bufferLength;
@@ -215,7 +214,7 @@ sealed unsafe class Chunk<T> : IDisposable where T : IBinaryInteger<T>
     private readonly BytesComparer comparer;
     private readonly Dictionary<BufferString, KeyInfo>.AlternateLookup<ReadOnlySpan<byte>> alt;
 
-    private readonly List<(int Number, T Value)> pairs = [];
+    private readonly List<(int Number, long Value)> pairs = [];
     private readonly List<int> textLengths = [];
 
     private byte* sortKeyBuffer;
@@ -237,7 +236,7 @@ sealed unsafe class Chunk<T> : IDisposable where T : IBinaryInteger<T>
     public int Used => comparer.Offset;
 
     /// <summary>CSR-массив значений после finalize.</summary>
-    public T[]? Values { get; internal set; }
+    public long[]? Values { get; internal set; }
 
     /// <summary>Границы диапазонов значений по номерам ключей (длина K+1).</summary>
     public int[]? CsrOffsets { get; internal set; }
@@ -261,7 +260,7 @@ sealed unsafe class Chunk<T> : IDisposable where T : IBinaryInteger<T>
     /// Строит CSR-массив значений: границы по номерам ключей (префикс-сумма количеств)
     /// и scatter пар в свои диапазоны.
     /// </summary>
-    public T[] BuildCsr()
+    public long[] BuildCsr()
     {
         var k = textLengths.Count;
         var csr = new int[k + 1];
@@ -269,7 +268,7 @@ sealed unsafe class Chunk<T> : IDisposable where T : IBinaryInteger<T>
             csr[number + 1]++;
         for (var i = 1; i <= k; i++)
             csr[i] += csr[i - 1];
-        var values = GC.AllocateUninitializedArray<T>(pairs.Count);
+        var values = GC.AllocateUninitializedArray<long>(pairs.Count);
         var fill = new int[k];
         foreach (var (number, value) in pairs)
             values[csr[number] + fill[number]++] = value;
@@ -302,7 +301,7 @@ sealed unsafe class Chunk<T> : IDisposable where T : IBinaryInteger<T>
     /// Добавляет строку: текст (уже скопирован в буфер чанка) и значение.
     /// Новый текст получает очередной номер; пара (номер, значение) — в общий список.
     /// </summary>
-    public void Add(ReadOnlySpan<byte> text, T value)
+    public void Add(ReadOnlySpan<byte> text, long value)
     {
         ref var info = ref CollectionsMarshal.GetValueRefOrAddDefault(alt, text, out var exist);
         if (!exist)

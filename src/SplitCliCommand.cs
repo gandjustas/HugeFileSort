@@ -60,7 +60,7 @@ internal partial class SplitCliCommand
     private readonly ObjectPool<Dictionary<BufferString, KeyInfo>> dictionaryPool = new DefaultObjectPool<Dictionary<BufferString, KeyInfo>>(new LookupPoolPolicy());
 
     public Task<int> RunAsync(CliContext context) =>
-        RootCliCommand.RunWithSettingsAsync(CompareOptionsName, (encoding, compareOptions, ct) => ExecuteAsync(encoding, compareOptions, ct), context);
+        RootCliCommand.RunWithSettingsAsync(CompareOptionsName, ExecuteAsync, context);
 
     private async Task<int> ExecuteAsync(Encoding encoding, CompareOptions compareOptions, CancellationToken ct)
     {
@@ -76,7 +76,7 @@ internal partial class SplitCliCommand
         Initialize(encoding, compareOptions);
         var files = new ConcurrentQueue<FileInfo>();
 
-        var sorter = new TransformBlock<Chunk<long>, Chunk<long>>(
+        var sorter = new TransformBlock<Chunk, Chunk>(
             chunk =>
             {
                 SortChunk(chunk, ct);
@@ -89,7 +89,7 @@ internal partial class SplitCliCommand
                 EnsureOrdered = false,
                 CancellationToken = ct,
             });
-        var compressor = new TransformBlock<Chunk<long>, CompressedChunk>(
+        var compressor = new TransformBlock<Chunk, CompressedChunk>(
             CompressChunk,
             new ExecutionDataflowBlockOptions
             {
@@ -234,9 +234,9 @@ internal partial class SplitCliCommand
     /// Собирает строки в чанки: байты текста строки — ключ Dictionary (ArraySegment в буфере чанка,
     /// сравнение по байтам), число — элемент списка. Повторный текст добавляет число в список существующего ключа.
     /// </summary>
-    internal async IAsyncEnumerable<Chunk<long>> SplitToChunks(IAsyncEnumerable<ReadOnlySequence<byte>> lines, int bufferSize, [EnumeratorCancellation] CancellationToken ct = default)
+    internal async IAsyncEnumerable<Chunk> SplitToChunks(IAsyncEnumerable<ReadOnlySequence<byte>> lines, int bufferSize, [EnumeratorCancellation] CancellationToken ct = default)
     {
-        Chunk<long> chunk = new(dictionaryPool, bufferSize);
+        Chunk chunk = new(dictionaryPool, bufferSize);
         await foreach (var line in lines.WithCancellation(ct).ConfigureAwait(false))
         {
             SequenceReader<byte> reader = new(line);
@@ -279,7 +279,7 @@ internal partial class SplitCliCommand
         return long.Parse(chars[..written], null);
     }
 
-    private void AddToChunk(Chunk<long> chunk, long x, ReadOnlySequence<byte> text)
+    private void AddToChunk(Chunk chunk, long x, ReadOnlySequence<byte> text)
     {
         byte[]? rented = null;
         try
@@ -301,7 +301,7 @@ internal partial class SplitCliCommand
     /// параллельно — sort key по ключам и сортировка CSR-диапазонов; порядок записи — по sort key.
     /// Ordinal-режим: sort key не вычисляются, порядок — по байтам текста.
     /// </summary>
-    private void SortChunk(Chunk<long> chunk, CancellationToken ct)
+    private void SortChunk(Chunk chunk, CancellationToken ct)
     {
         var keyCount = chunk.KeyCount;
         var maxKeyBytes = chunk.TextLengths.Count > 0 ? chunk.TextLengths.Max() : 0;
@@ -390,7 +390,7 @@ internal partial class SplitCliCommand
     /// Order (memcpy текстов + varint-заголовки), one-shot zstd S → C. Буфер текстов чанка
     /// освобождается сразу после сериализации, до сжатия.
     /// </summary>
-    private unsafe CompressedChunk CompressChunk(Chunk<long> chunk)
+    private unsafe CompressedChunk CompressChunk(Chunk chunk)
     {
         var index = Interlocked.Increment(ref savedChunkCount) - 1;
         var chunkFile = new FileInfo(Path.ChangeExtension(Source.FullName, $".chunk-{index:D3}{Path.GetExtension(Source.FullName)}"));
@@ -433,7 +433,7 @@ internal partial class SplitCliCommand
     /// varint(длина текста), текст, varint(количество чисел), varint(разности чисел) — для каждого
     /// ключа в порядке Order. Sort key в файл не пишутся — merge пересчитывает их пакетами.
     /// </summary>
-    private static void SerializeChunk(Chunk<long> chunk, Span<byte> dst)
+    private static void SerializeChunk(Chunk chunk, Span<byte> dst)
     {
         var textOffsets = chunk.TextOffsets!;
         var values = chunk.Values!;
@@ -470,7 +470,7 @@ internal partial class SplitCliCommand
     }
 
     /// <summary>Точный несжатый размер файла чанка до сериализации — для аллокации буфера S.</summary>
-    private static long ComputeChunkSize(Chunk<long> chunk)
+    private static long ComputeChunkSize(Chunk chunk)
     {
         var textOffsets = chunk.TextOffsets!;
         var csr = chunk.CsrOffsets!;

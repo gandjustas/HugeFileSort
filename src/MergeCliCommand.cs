@@ -33,7 +33,7 @@ internal partial class MergeCliCommand
     internal long? PreallocatedLength { get; set; }
 
     public Task<int> RunAsync(CliContext context) =>
-        RootCliCommand.RunWithSettingsAsync(CompareOptionsName, (encoding, compareOptions, ct) => ExecuteAsync(encoding, compareOptions, ct), context);
+        RootCliCommand.RunWithSettingsAsync(CompareOptionsName, ExecuteAsync, context);
 
     private async Task<int> ExecuteAsync(Encoding encoding, CompareOptions compareOptions, CancellationToken ct)
     {
@@ -71,12 +71,12 @@ internal partial class MergeCliCommand
         // Продюсеры чанков: sort key пакетов считаются под глобальным CPU-слотом (=ProcessorCount),
         // чтобы суммарная CPU-работа не порождала больше активных потоков, чем ядер.
         var cpuSlots = new SemaphoreSlim(Environment.ProcessorCount);
-        var channels = new Channel<Batch<long>>[chunkFiles.Count];
+        var channels = new Channel<Batch>[chunkFiles.Count];
         var producers = new Task[chunkFiles.Count];
         for (var i = 0; i < chunkFiles.Count; i++)
         {
             var file = chunkFiles[i];
-            var channel = Channel.CreateBounded<Batch<long>>(new BoundedChannelOptions(2) { SingleWriter = true, SingleReader = true });
+            var channel = Channel.CreateBounded<Batch>(new BoundedChannelOptions(2) { SingleWriter = true, SingleReader = true });
             channels[i] = channel;
             producers[i] = ProduceChunk(file, channel, cpuSlots, encoding, compareOptions, ct);
         }
@@ -87,7 +87,7 @@ internal partial class MergeCliCommand
             var sources = channels.Select(c => MergeExtensions.ReadEntries(c.Reader, ct));
             var number = new char[32];
             var writer = pipe.Writer;
-            await foreach (var group in sources.MergeSorted(ChunkEntryComparer<long>.Instance, MergeGroup, ct).WithCancellation(ct).ConfigureAwait(false))
+            await foreach (var group in sources.MergeSorted(ChunkEntryComparer.Instance, MergeGroup, ct).WithCancellation(ct).ConfigureAwait(false))
             {
                 foreach (var (value, text) in group)
                 {
@@ -128,7 +128,7 @@ internal partial class MergeCliCommand
     }
 
     /// <summary>Продюсер одного чанка: декомпрессия → пакеты записей → канал.</summary>
-    private async Task ProduceChunk(FileInfo file, Channel<Batch<long>> channel, SemaphoreSlim cpuSlots, Encoding encoding, CompareOptions compareOptions, CancellationToken ct)
+    private async Task ProduceChunk(FileInfo file, Channel<Batch> channel, SemaphoreSlim cpuSlots, Encoding encoding, CompareOptions compareOptions, CancellationToken ct)
     {
         try
         {
@@ -179,7 +179,7 @@ internal partial class MergeCliCommand
     /// например «ß» и «ss» в de-DE) в единый поток (значение, текст) по возрастанию значения.
     /// Штатный случай — одна запись в группе: значения отдаются напрямую, без хипа и LINQ-цепочек.
     /// </summary>
-    private IEnumerable<(long Value, ArraySegment<byte> Text)> MergeGroup(IReadOnlyList<ReadChunkEntry<long>> group)
+    private IEnumerable<(long Value, ArraySegment<byte> Text)> MergeGroup(IReadOnlyList<ReadChunkEntry> group)
     {
         if (group.Count == 1)
             return SingleGroup(group[0]);
@@ -189,7 +189,7 @@ internal partial class MergeCliCommand
             .MergeSorted(ValueIndexComparer)
             .Select(pair => (pair.Value, group[pair.Index].Text));
 
-        static IEnumerable<(long Value, ArraySegment<byte> Text)> SingleGroup(ReadChunkEntry<long> entry)
+        static IEnumerable<(long Value, ArraySegment<byte> Text)> SingleGroup(ReadChunkEntry entry)
         {
             var text = entry.Text;
             var values = entry.ValuesArray;
@@ -197,7 +197,7 @@ internal partial class MergeCliCommand
                 yield return (values[entry.ValuesStart + i], text);
         }
 
-        static IEnumerable<(long Value, int Index)> EnumerateValues(ReadChunkEntry<long> entry, int index)
+        static IEnumerable<(long Value, int Index)> EnumerateValues(ReadChunkEntry entry, int index)
         {
             for (var i = 0; i < entry.ValuesCount; i++)
                 yield return (entry.ValuesArray[entry.ValuesStart + i], index);

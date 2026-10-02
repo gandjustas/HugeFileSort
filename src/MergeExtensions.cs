@@ -1,6 +1,5 @@
 using System.Buffers;
 using System.Globalization;
-using System.Numerics;
 using System.Runtime.CompilerServices;
 using System.Text;
 using System.Threading.Channels;
@@ -15,21 +14,21 @@ static class MergeExtensions
     /// буферы из декомпрессионного потока, не дожидаясь CPU, вычислитель считает sort key пакета
     /// под глобальным CPU-слотом. Буфер с текстами записей переходит во владение пакету.
     /// </summary>
-    public static Task ProduceBatches<T>(
+    public static Task ProduceBatches(
         this Stream stream,
-        ChannelWriter<Batch<T>> channel,
+        ChannelWriter<Batch> channel,
         Encoding encoding,
         CompareInfo compareInfo,
         CompareOptions compareOptions,
         SemaphoreSlim cpuSlots,
         int batchBytes,
-        CancellationToken ct) where T : IBinaryInteger<T>
+        CancellationToken ct)
     {
         var buffers = Channel.CreateBounded<(byte[] Buffer, int Filled, bool Eof)>(
             new BoundedChannelOptions(1) { SingleWriter = true, SingleReader = true });
         return Task.WhenAll(
             ReadChunks(stream, buffers.Writer, batchBytes, ct),
-            ComputeBatches<T>(buffers.Reader, channel, encoding, compareInfo, compareOptions, cpuSlots, batchBytes, ct));
+            ComputeBatches(buffers.Reader, channel, encoding, compareInfo, compareOptions, cpuSlots, batchBytes, ct));
     }
 
     /// <summary>Читатель: наполняет буферы до конца (или eof) и передаёт вычислителю.</summary>
@@ -76,15 +75,15 @@ static class MergeExtensions
     }
 
     /// <summary>Вычислитель: разбирает порции в пакеты под CPU-слотом и кладёт в выходной канал.</summary>
-    private static async Task ComputeBatches<T>(
+    private static async Task ComputeBatches(
         ChannelReader<(byte[] Buffer, int Filled, bool Eof)> buffers,
-        ChannelWriter<Batch<T>> channel,
+        ChannelWriter<Batch> channel,
         Encoding encoding,
         CompareInfo compareInfo,
         CompareOptions compareOptions,
         SemaphoreSlim cpuSlots,
         int batchBytes,
-        CancellationToken ct) where T : IBinaryInteger<T>
+        CancellationToken ct)
     {
         byte[]? pending = null; // хвост незавершённой записи прошлой порции
         var pendingLen = 0;
@@ -114,12 +113,12 @@ static class MergeExtensions
                 }
                 var end = pendingLen + filled;
 
-                Batch<T> batch;
+                Batch batch;
                 int consumed;
                 await cpuSlots.WaitAsync(ct).ConfigureAwait(false);
                 try
                 {
-                    batch = ParseBatch<T>(batchBuffer, 0, end, encoding, compareInfo, compareOptions, eof, out consumed);
+                    batch = ParseBatch(batchBuffer, end, encoding, compareInfo, compareOptions, eof, out consumed);
                 }
                 catch
                 {
@@ -162,25 +161,25 @@ static class MergeExtensions
     }
 
     /// <summary>
-    /// Разбирает записи из среза буфера [start, end): тексты остаются в буфере (zero-copy),
+    /// Разбирает записи из среза буфера [0, end): тексты остаются в буфере (zero-copy),
     /// значения δ-варинтов разворачиваются в общий массив, sort key вычисляются двумя пассами
     /// (длины → запись). ordinal-режим: ключ не вычисляется, SortKey алиасит текст.
     /// consumed — граница последней полной записи; на atEof хвост за ней — усечённая запись.
     /// </summary>
-    private static Batch<T> ParseBatch<T>(
-        byte[] buffer, int start, int end,
+    private static Batch ParseBatch(
+        byte[] buffer, int end,
         Encoding encoding,
         CompareInfo compareInfo,
         CompareOptions compareOptions,
         bool atEof,
-        out int consumed) where T : IBinaryInteger<T>
+        out int consumed)
     {
         var metas = new List<BatchEntryMeta>();
-        var values = new List<T>();
+        var values = new List<long>();
         // Срез от начала буфера: TryReadVarint индексирует pos относительно начала среза,
         // а pos здесь — абсолютное смещение в буфере.
         var span = buffer.AsSpan(0, end);
-        var pos = start;
+        var pos = 0;
         while (pos < end)
         {
             var entryStart = pos;
@@ -198,7 +197,7 @@ static class MergeExtensions
                 break;
             }
             var valuesStart = values.Count;
-            T previous = T.Zero;
+            long previous = 0;
             var complete = true;
             for (ulong i = 0; i < count; i++)
             {
@@ -207,7 +206,7 @@ static class MergeExtensions
                     complete = false;
                     break;
                 }
-                previous += T.CreateChecked(delta);
+                previous += checked((long)delta);
                 values.Add(previous);
             }
             if (!complete)
@@ -232,12 +231,12 @@ static class MergeExtensions
         var valuesArray = values.ToArray();
         var entryCount = metas.Count;
 
-        Batch<T> batch;
-        var entries = new ReadChunkEntry<T>[entryCount];
+        Batch batch;
+        var entries = new ReadChunkEntry[entryCount];
 
         if (compareOptions == CompareOptions.Ordinal)
         {
-            batch = new Batch<T>(buffer, null, valuesArray, entryCount);
+            batch = new Batch(buffer, null, valuesArray, entryCount);
             // Ключ — байты текста: сегмент SortKey алиасит сегмент Text.
             for (var i = 0; i < entryCount; i++)
             {
@@ -269,7 +268,7 @@ static class MergeExtensions
                 keyOffsets[i + 1] = keyOffsets[i] + keyLengths[i];
             var keyBuffer = ArrayPool<byte>.Shared.Rent(checked((int)totalKeys));
 
-            batch = new Batch<T>(buffer, keyBuffer, valuesArray, entryCount);
+            batch = new Batch(buffer, keyBuffer, valuesArray, entryCount);
 
             // Пасс B: sort key каждой записи в общий буфер пакета.
             for (var i = 0; i < entryCount; i++)
@@ -289,9 +288,9 @@ static class MergeExtensions
     }
 
     /// <summary>Адаптер канала пакетов к потоку записей для MergeSorted (Dispose каждой записи освобождает пакет).</summary>
-    internal static async IAsyncEnumerable<ReadChunkEntry<T>> ReadEntries<T>(
-        ChannelReader<Batch<T>> reader,
-        [EnumeratorCancellation] CancellationToken ct = default) where T : IBinaryInteger<T>
+    internal static async IAsyncEnumerable<ReadChunkEntry> ReadEntries(
+        ChannelReader<Batch> reader,
+        [EnumeratorCancellation] CancellationToken ct = default)
     {
         while (await reader.WaitToReadAsync(ct).ConfigureAwait(false))
         {
@@ -463,19 +462,4 @@ static class MergeExtensions
             }
         }
     }
-
-    public static async IAsyncEnumerable<T> Concat<T>(
-        this IEnumerable<IAsyncEnumerable<T>> sources,
-        [EnumeratorCancellation] CancellationToken ct = default)
-    {
-        foreach (var source in sources)
-        {
-            await foreach (var item in source.WithCancellation(ct).ConfigureAwait(false))
-            {
-                yield return item;
-            }
-        }
-    }
-
-
 }

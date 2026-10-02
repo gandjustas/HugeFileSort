@@ -4,8 +4,6 @@ using System.Runtime.CompilerServices;
 
 static class PipeExtensions
 {
-    public delegate T ParseDelegate<T>(ref ReadOnlySequence<byte> buffer) where T: allows ref struct;
-
     extension(PipeReader reader)
     {
 
@@ -75,45 +73,6 @@ static class PipeExtensions
             await reader.CompleteAsync().ConfigureAwait(false);
         }
     }
-
-        public IAsyncEnumerable<T> Parse<T>(ParseDelegate<T> parse) where T: allows ref struct
-        {
-            ArgumentNullException.ThrowIfNull(reader);
-            ArgumentNullException.ThrowIfNull(parse);
-            return new ParserAsyncEnumerable<T>(reader, parse);
-        }
-
-    
-    }
-
-    class ParserAsyncEnumerable<T>(PipeReader reader, ParseDelegate<T> parse) : IAsyncEnumerable<T>, IAsyncEnumerator<T> where T : allows ref struct
-    {
-        bool started = false;
-        CancellationToken ct = default;
-        ReadOnlySequence<byte> buffer;
-
-        public T Current => parse(ref buffer);
-
-        public ValueTask DisposeAsync()
-        {
-            return reader.CompleteAsync();            
-        }
-
-        public IAsyncEnumerator<T> GetAsyncEnumerator(CancellationToken cancellationToken = default)
-        {
-            if(started) throw new InvalidOperationException();
-            started = true;
-            ct = cancellationToken;
-            return this;            
-        }
-
-        public async ValueTask<bool> MoveNextAsync()
-        {
-            reader.AdvanceTo(buffer.Start);
-            var result = await reader.ReadAsync(ct);
-            buffer = result.Buffer;
-            return !result.IsCompleted || buffer.Length > 0;
-        }
 
     }
 }
