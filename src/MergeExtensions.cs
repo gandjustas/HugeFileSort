@@ -24,7 +24,7 @@ static class MergeExtensions
         int batchBytes,
         CancellationToken ct)
     {
-        var buffers = Channel.CreateBounded<(byte[] Buffer, int Filled, bool Eof)>(
+        Channel<(byte[] Buffer, int Filled, bool Eof)> buffers = Channel.CreateBounded<(byte[] Buffer, int Filled, bool Eof)>(
             new BoundedChannelOptions(1) { SingleWriter = true, SingleReader = true });
         return Task.WhenAll(
             ReadChunks(stream, buffers.Writer, batchBytes, ct),
@@ -174,8 +174,8 @@ static class MergeExtensions
         bool atEof,
         out int consumed)
     {
-        var metas = new List<BatchEntryMeta>();
-        var values = new List<long>();
+        List<BatchEntryMeta> metas = new();
+        List<long> values = new();
         // Срез от начала буфера: TryReadVarint индексирует pos относительно начала среза,
         // а pos здесь — абсолютное смещение в буфере.
         var span = buffer.AsSpan(0, end);
@@ -232,16 +232,16 @@ static class MergeExtensions
         var entryCount = metas.Count;
 
         Batch batch;
-        var entries = new ReadChunkEntry[entryCount];
+        ReadChunkEntry[] entries = new ReadChunkEntry[entryCount];
 
         if (compareOptions == CompareOptions.Ordinal)
         {
-            batch = new Batch(buffer, null, valuesArray, entryCount);
+            batch = new Batch(buffer, null, entryCount);
             // Ключ — байты текста: сегмент SortKey алиасит сегмент Text.
             for (var i = 0; i < entryCount; i++)
             {
                 var m = metas[i];
-                var text = new ArraySegment<byte>(buffer, m.TextOffset, m.TextLength);
+                ArraySegment<byte> text = new(buffer, m.TextOffset, m.TextLength);
                 entries[i] = new(batch, text, text, valuesArray, m.ValuesStart, m.ValuesCount);
             }
         }
@@ -268,7 +268,7 @@ static class MergeExtensions
                 keyOffsets[i + 1] = keyOffsets[i] + keyLengths[i];
             var keyBuffer = ArrayPool<byte>.Shared.Rent(checked((int)totalKeys));
 
-            batch = new Batch(buffer, keyBuffer, valuesArray, entryCount);
+            batch = new Batch(buffer, keyBuffer, entryCount);
 
             // Пасс B: sort key каждой записи в общий буфер пакета.
             for (var i = 0; i < entryCount; i++)
@@ -308,7 +308,7 @@ static class MergeExtensions
         Func<IReadOnlyList<T>, V> merge,
         [EnumeratorCancellation] CancellationToken ct = default)
     {
-        var enumerators = sources.Select(s => s.GetAsyncEnumerator(ct)).ToList();
+        List<IAsyncEnumerator<T>> enumerators = sources.Select(s => s.GetAsyncEnumerator(ct)).ToList();
         try
         {
             await foreach (var x in MergeSortedWithPriorityQueue(enumerators, comparer, merge, ct).ConfigureAwait(false))
@@ -390,7 +390,7 @@ static class MergeExtensions
         this IEnumerable<IEnumerable<T>> sources,
         IComparer<T> comparer)
     {
-        var enumerators = sources.Select(s => s.GetEnumerator()).ToList();
+        List<IEnumerator<T>> enumerators = sources.Select(s => s.GetEnumerator()).ToList();
         try
         {
             if (enumerators.Count == 1)

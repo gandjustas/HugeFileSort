@@ -1,6 +1,4 @@
 <Solution>
-  <Folder Name="/benchmarks/">
-    <Project Path="benchmarks/HugeFileSort.Benchmarks.csproj" />
-  </Folder>
   <Project Path="src/huge-file.csproj" />
+  <Project Path="benchmarks/HugeFileSort.Benchmarks.csproj" />
 </Solution>

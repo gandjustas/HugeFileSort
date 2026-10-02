@@ -6,12 +6,12 @@ static class Smoke
     public static void Run()
     {
         InputFile.EnsureCreated();
-        var file = new FileInfo(InputFile.FullPath);
+        FileInfo file = new(InputFile.FullPath);
         var sizeMb = file.Length / (1024.0 * 1024.0);
         Console.WriteLine($"Файл: {file.FullName} ({sizeMb:F0} МБ)");
         Console.WriteLine();
 
-        var sw = Stopwatch.StartNew();
+        Stopwatch sw = Stopwatch.StartNew();
         var sync = FileReadingBenchmarks.CountLinesFileStreamSync();
         Report("FileStreamSync", sync, sw.ElapsedMilliseconds);
 

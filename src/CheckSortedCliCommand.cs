@@ -20,7 +20,7 @@ internal partial class CheckSortedCliCommand
         var compareInfo = CultureInfo.CurrentCulture.CompareInfo;
         var newLine = encoding.GetBytes(Environment.NewLine);
         var dotSpace = encoding.GetBytes(". ");
-        var reader = PipeReader.Create(Source.OpenRead());
+        PipeReader reader = PipeReader.Create(Source.OpenRead());
 
         (string? s, long x) last = (null, 0L);
         var sorted = true;

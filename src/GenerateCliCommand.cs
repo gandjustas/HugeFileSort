@@ -23,7 +23,7 @@ internal partial class GenerateCliCommand
         var numberBuffer = new char[16];
         long written = 0;
 
-        var writer = PipeWriter.Create(Destination.Create());
+        PipeWriter writer = PipeWriter.Create(Destination.Create());
         while (written < Size * 1024L * 1024L)
         {
             random.Next().TryFormat(numberBuffer, out var digits, "d");

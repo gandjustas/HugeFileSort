@@ -47,15 +47,15 @@ static class InputFile
     /// <summary>Создаёт файл, если он отсутствует или имеет другой размер.</summary>
     public static void EnsureCreated()
     {
-        var info = new FileInfo(FullPath);
+        FileInfo info = new(FullPath);
         if (info.Exists && info.Length == ExpectedLength)
             return;
 
         var lineBytes = Encoding.UTF8.GetByteCount($"{0L,12}. {LineBody}\n");
         var lineCount = SizeMb * 1024 * 1024 / lineBytes;
 
-        using var fs = new FileStream(FullPath, FileMode.Create, FileAccess.Write, FileShare.None, BlockSize);
-        using var writer = new StreamWriter(fs, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false), BlockSize);
+        using FileStream fs = new(FullPath, FileMode.Create, FileAccess.Write, FileShare.None, BlockSize);
+        using StreamWriter writer = new(fs, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false), BlockSize);
         for (long i = 0; i < lineCount; i++)
         {
             writer.Write($"{i,12}. {LineBody}");
@@ -103,7 +103,7 @@ public class FileReadingBenchmarks
     public static async Task<long> CountLinesPipeReaderOverStreamAsync()
     {
         using var fs = InputFile.OpenRead();
-        var reader = PipeReader.Create(fs, new StreamPipeReaderOptions(bufferSize: InputFile.BlockSize));
+        PipeReader reader = PipeReader.Create(fs, new StreamPipeReaderOptions(bufferSize: InputFile.BlockSize));
         long lines = 0;
         while (true)
         {
@@ -122,12 +122,12 @@ public class FileReadingBenchmarks
     /// <summary>Продюсер в отдельном потоке синхронно читает файл прямо в память Pipe (без копий), потребитель считает строки.</summary>
     public static async Task<long> CountLinesPipeWithProducerThreadAsync()
     {
-        var pipe = new Pipe(new PipeOptions(
+        Pipe pipe = new(new PipeOptions(
             pauseWriterThreshold: 4L * InputFile.BlockSize,
             resumeWriterThreshold: 2L * InputFile.BlockSize));
 
         Exception? producerError = null;
-        var producer = new Thread(() =>
+        Thread producer = new(() =>
         {
             try
             {

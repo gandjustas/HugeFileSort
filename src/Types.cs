@@ -69,8 +69,8 @@ sealed unsafe class NativeSegmentComparer(byte* buffer) : IComparer<BufferString
     {
         if (x.Offset == y.Offset && x.Length == y.Length)
             return 0;
-        var sx = new ReadOnlySpan<byte>(buffer + x.Offset, x.Length);
-        var sy = new ReadOnlySpan<byte>(buffer + y.Offset, y.Length);
+        ReadOnlySpan<byte> sx = new(buffer + x.Offset, x.Length);
+        ReadOnlySpan<byte> sy = new(buffer + y.Offset, y.Length);
         return sx.SequenceCompareTo(sy);
     }
 }
@@ -110,11 +110,10 @@ sealed class ReadChunkEntry(
 /// Пакет живёт, пока merge не потребит все записи: каждая ReadChunkEntry.Dispose уменьшает
 /// счётчик, последний возвращает массивы в пулы.
 /// </summary>
-sealed class Batch(byte[] buffer, byte[]? sortKeyBuffer, long[] values, int entryCount)
+sealed class Batch(byte[] buffer, byte[]? sortKeyBuffer, int entryCount)
 {
     private readonly byte[] buffer = buffer;
     private readonly byte[]? sortKeyBuffer = sortKeyBuffer;
-    private readonly long[] values = values;
     private int remaining = entryCount;
 
     /// <summary>Записи пакета; заполняется после создания пакета.</summary>
@@ -136,18 +135,11 @@ sealed class Batch(byte[] buffer, byte[]? sortKeyBuffer, long[] values, int entr
 readonly record struct BatchEntryMeta(int TextOffset, int TextLength, int ValuesStart, int ValuesCount);
 
 /// <summary>Сжатый чанк в памяти: файл назначения и нативный буфер сжатых данных (освобождает писатель).</summary>
-unsafe struct CompressedChunk : IDisposable
+unsafe struct CompressedChunk(FileInfo file, byte* buffer, int length) : IDisposable
 {
-    public readonly FileInfo File;
-    public byte* Buffer;
-    public readonly int Length;
-
-    public CompressedChunk(FileInfo file, byte* buffer, int length)
-    {
-        File = file;
-        Buffer = buffer;
-        Length = length;
-    }
+    public readonly FileInfo File = file;
+    public byte* Buffer = buffer;
+    public readonly int Length = length;
 
     public unsafe void Dispose()
     {

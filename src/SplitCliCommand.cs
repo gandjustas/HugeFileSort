@@ -10,6 +10,8 @@ using System.Text;
 using System.Threading.Tasks.Dataflow;
 using DotMake.CommandLine;
 using Microsoft.Extensions.ObjectPool;
+using System.Linq;
+using System.Threading.Channels;
 
 /// <summary>
 /// Команда split и конвейер разбиения: читает исходник, собирает строки в чанки (текст — ключ
@@ -26,6 +28,7 @@ internal partial class SplitCliCommand
 
     // Граница stackalloc для декодирующего char-буфера числа.
     private const int StackallocCharThreshold = 512;
+    private const int ReadBufferSize = 1 << 20;
 
     [CliArgument(Description = "Source file to split", ValidationRules = CliValidationRules.ExistingFile)]
     public FileInfo Source { get; set; } = null!;
@@ -64,116 +67,81 @@ internal partial class SplitCliCommand
 
     private async Task<int> ExecuteAsync(Encoding encoding, CompareOptions compareOptions, CancellationToken ct)
     {
-        var files = await SplitAsync(encoding, compareOptions, ct);
-        foreach (var file in files)
+        Channel<FileInfo> files = Channel.CreateUnbounded<FileInfo>();
+        var t = SplitAsync(encoding, compareOptions, files.Writer, ct);
+        await foreach (var file in files.Reader.ReadAllAsync(ct))
             Console.WriteLine(file.FullName);
+        await t;
         return 0;
     }
 
     /// <summary>Запускает конвейер разбиения с готовыми настройками; используется и командой sort.</summary>
-    internal async Task<List<FileInfo>> SplitAsync(Encoding encoding, CompareOptions compareOptions, CancellationToken ct)
+    internal async Task SplitAsync(
+        Encoding encoding, 
+        CompareOptions compareOptions, 
+        ChannelWriter<FileInfo> files,
+        CancellationToken ct)
     {
         Initialize(encoding, compareOptions);
-        var files = new ConcurrentQueue<FileInfo>();
 
-        var sorter = new TransformBlock<Chunk, Chunk>(
+        TransformBlock<Chunk, Chunk> sorter = new(
             chunk =>
             {
                 SortChunk(chunk, ct);
                 return chunk;
             },
-            new ExecutionDataflowBlockOptions
+            new ()
             {
                 MaxDegreeOfParallelism = Parallelism,
                 BoundedCapacity = Parallelism + 2,
                 EnsureOrdered = false,
                 CancellationToken = ct,
             });
-        var compressor = new TransformBlock<Chunk, CompressedChunk>(
+        TransformBlock<Chunk, CompressedChunk> compressor = new(
             CompressChunk,
-            new ExecutionDataflowBlockOptions
+            new ()
             {
                 MaxDegreeOfParallelism = 2,
                 BoundedCapacity = 2,
                 EnsureOrdered = false,
                 CancellationToken = ct,
             });
-        // Последняя стадия — ActionBlock: у него нет выходной очереди, поэтому BoundedCapacity
-        // считает только вход (у TransformBlock непотреблённый выход тоже занимает лимит и
-        // без связанного получателя блокирует стадию после первого чанка).
-        var saver = new ActionBlock<CompressedChunk>(
-            chunk =>
+        ActionBlock<CompressedChunk> saver = new(
+            async chunk =>
             {
                 WriteChunk(in chunk);
                 chunk.Dispose();
-                files.Enqueue(chunk.File);
+                await files.WriteAsync(chunk.File, ct);
             },
-            new ExecutionDataflowBlockOptions
+            new ()
             {
                 MaxDegreeOfParallelism = 1,
                 BoundedCapacity = 1,
                 EnsureOrdered = false,
                 CancellationToken = ct,
             });
-        var sorterToCompressor = sorter.LinkTo(compressor, new DataflowLinkOptions { PropagateCompletion = true });
-        var compressorToSaver = compressor.LinkTo(saver, new DataflowLinkOptions { PropagateCompletion = true });
+        using var sorterToCompressor = sorter.LinkTo(compressor, new DataflowLinkOptions { PropagateCompletion = true });
+        using var compressorToSaver = compressor.LinkTo(saver, new DataflowLinkOptions { PropagateCompletion = true });
 
         // Чтение исходника выделенным потоком: sync FileStream → Pipe (опережение разбора на 8-16 МБ).
-        var pipe = new Pipe(new PipeOptions(
-            minimumSegmentSize: 1 << 20,
-            pauseWriterThreshold: 16 << 20,
-            resumeWriterThreshold: 8 << 20,
+        Pipe pipe = new(new PipeOptions(
+            minimumSegmentSize: ReadBufferSize,
+            resumeWriterThreshold: ReadBufferSize * 8,
+            pauseWriterThreshold: ReadBufferSize * 16,
             useSynchronizationContext: false));
         var fill = Task.Factory.StartNew(() => FillPipe(pipe.Writer, ct), ct, TaskCreationOptions.LongRunning, TaskScheduler.Default);
 
-        Exception? loopError = null;
-        try
+        var lines = pipe.Reader.Split(newLine, ct);
+        var completed = await SplitToChunks(lines, bufferSize, ct)
+            .AllAsync(async (c, ct) => await sorter.SendAsync(c, ct), ct)
+            .ConfigureAwait(false);
+        if(!completed)
         {
-            await foreach (var chunk in SplitToChunks(pipe.Reader.Split(newLine, ct), bufferSize, ct).ConfigureAwait(false))
-            {
-                if (!await sorter.SendAsync(chunk, ct).ConfigureAwait(false))
-                {
-                    // Конвейер остановился (сбой стадии) — буфер чанка больше никому не нужен.
-                    chunk.Dispose();
-                    break;
-                }
-            }
-        }
-        catch (Exception ex)
-        {
-            loopError = ex;
+            throw new InvalidOperationException();
         }
         sorter.Complete();
-
-        try
-        {
-            await sorter.Completion.ConfigureAwait(false);
-            await compressor.Completion.ConfigureAwait(false);
-            await saver.Completion.ConfigureAwait(false);
-        }
-        finally
-        {
-            sorterToCompressor.Dispose();
-            compressorToSaver.Dispose();
-        }
-
-        try
-        {
-            await fill.ConfigureAwait(false);
-        }
-        catch (Exception ex) when (loopError is not null)
-        {
-            // Первая ошибка — из цикла разбора; исключение fill теряется намеренно
-            _ = ex;
-        }
-
-        if (loopError is not null)
-            throw new InvalidOperationException("Failed to split the source file", loopError);
-
-        List<FileInfo> result = [];
-        while (files.TryDequeue(out var file))
-            result.Add(file);
-        return result;
+        await Task.WhenAll(fill, sorter.Completion, compressor.Completion, saver.Completion);
+        files.Complete();
     }
 
     /// <summary>
@@ -210,17 +178,24 @@ internal partial class SplitCliCommand
     {
         try
         {
-            using var fileStream = new FileStream(Source.FullName, FileMode.Open, FileAccess.Read, FileShare.Read,
-                bufferSize: 0, FileOptions.SequentialScan);
+            using FileStream fileStream = new(
+                Source.FullName, 
+                FileMode.Open, 
+                FileAccess.Read, 
+                FileShare.Read,
+                bufferSize: 0, 
+                FileOptions.SequentialScan);
             while (true)
             {
                 ct.ThrowIfCancellationRequested();
-                var span = writer.GetSpan(1 << 20);
+                var span = writer.GetSpan(ReadBufferSize);
                 var n = fileStream.Read(span);
                 if (n == 0) break;
                 writer.Advance(n);
-                var r = writer.FlushAsync(ct).AsTask().GetAwaiter().GetResult();
-                if (r.IsCompleted) break;
+                var r = writer.FlushAsync(ct);
+                while (!r.IsCompleted) Thread.Yield();
+                
+                if (r.Result.IsCompleted) break;
             }
             writer.Complete();
         }
@@ -314,7 +289,7 @@ internal partial class SplitCliCommand
 
         int[] sortKeyOffsets = [];
         int[] sortKeyLengths = [];
-        var parallelOptions = new ParallelOptions { CancellationToken = ct };
+        ParallelOptions parallelOptions = new() { CancellationToken = ct };
 
         if (!isOrdinal)
         {
@@ -343,7 +318,7 @@ internal partial class SplitCliCommand
         }
 
         // CSR значений: границы по номерам ключей и scatter пар.
-        var values = chunk.BuildCsr();
+        _ = chunk.BuildCsr();
         var csr = chunk.CsrOffsets!;
 
         // Параллельно: sort key каждого ключа (culture) и сортировка его CSR-диапазона.
@@ -354,7 +329,7 @@ internal partial class SplitCliCommand
             {
                 if (!isOrdinal)
                 {
-                    var w = encoding.GetChars(chunk.BufferSpan.Slice(textOffsets[i], textOffsets[i + 1] - textOffsets[i]), buf);
+                    var w = encoding.GetChars(chunk.BufferSpan[textOffsets[i]..textOffsets[i + 1]], buf);
                     compareInfo.GetSortKey(buf.AsSpan(0, w), chunk.GetSortKeySlice(sortKeyOffsets[i], sortKeyLengths[i]), compareOptions);
                 }
                 Array.Sort(csrValues, csr[i], csr[i + 1] - csr[i]);
@@ -364,19 +339,18 @@ internal partial class SplitCliCommand
 
         // Порядок записи: номера ключей по возрастанию sort key (ordinal — по байтам текста).
         var order = Enumerable.Range(0, keyCount).ToArray();
+        var indices = new BufferString[keyCount];
         if (isOrdinal)
         {
-            var texts = new BufferString[keyCount];
             for (var i = 0; i < keyCount; i++)
-                texts[i] = new BufferString(textOffsets[i], textOffsets[i + 1] - textOffsets[i]);
-            Array.Sort(texts, order, chunk.Comparer);
+                indices[i] = new (textOffsets[i], textOffsets[i + 1] - textOffsets[i]);
+            Array.Sort(indices, order, chunk.Comparer);
         }
         else
         {
-            var sortKeys = new BufferString[keyCount];
             for (var i = 0; i < keyCount; i++)
-                sortKeys[i] = new BufferString(sortKeyOffsets[i], sortKeyLengths[i]);
-            Array.Sort(sortKeys, order, chunk.CreateSortKeyComparer());
+                indices[i] = new (sortKeyOffsets[i], sortKeyLengths[i]);
+            Array.Sort(indices, order, chunk.CreateSortKeyComparer());
         }
         chunk.Order = order;
 
@@ -393,7 +367,7 @@ internal partial class SplitCliCommand
     private unsafe CompressedChunk CompressChunk(Chunk chunk)
     {
         var index = Interlocked.Increment(ref savedChunkCount) - 1;
-        var chunkFile = new FileInfo(Path.ChangeExtension(Source.FullName, $".chunk-{index:D3}{Path.GetExtension(Source.FullName)}"));
+        FileInfo chunkFile = new(Path.ChangeExtension(Source.FullName, $".chunk-{index:D3}{Path.GetExtension(Source.FullName)}"));
         byte* s = null;
         byte* c = null;
         try
@@ -405,7 +379,7 @@ internal partial class SplitCliCommand
 
             var cLength = checked((int)ZstandardEncoder.GetMaxCompressedLength(size));
             c = (byte*)NativeMemory.AlignedAlloc((nuint)cLength, 64);
-            using var encoder = new ZstandardEncoder(new ZstandardCompressionOptions
+            using ZstandardEncoder encoder = new(new ZstandardCompressionOptions
             {
                 Quality = ZstdLevel,
 #if NET10_0
@@ -468,8 +442,12 @@ internal partial class SplitCliCommand
     /// <summary>Пишет сжатый чанк на диск одним Write (преаллокация точного размера — без расширения по кусочкам).</summary>
     private static unsafe void WriteChunk(in CompressedChunk chunk)
     {
-        using var fileStream = new FileStream(chunk.File.FullName, FileMode.Create, FileAccess.Write, FileShare.None,
-            bufferSize: 0, FileOptions.SequentialScan);
+        using FileStream fileStream = new(
+            chunk.File.FullName, 
+            FileMode.Create, FileAccess.Write, FileShare.None,
+            bufferSize: 0, 
+            FileOptions.SequentialScan
+            );
         fileStream.SetLength(chunk.Length);
         fileStream.Write(new ReadOnlySpan<byte>(chunk.Buffer, chunk.Length));
     }

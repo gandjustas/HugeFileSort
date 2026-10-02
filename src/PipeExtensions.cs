@@ -49,7 +49,7 @@ static class PipeExtensions
                 while (true)
                 {
                     var search = buffer.Slice(consumed);
-                    var sequenceReader = new SequenceReader<byte>(search);
+                        SequenceReader<byte> sequenceReader = new(search);
                     if (!sequenceReader.TryReadTo(out ReadOnlySequence<byte> segment, delimiter.Span))
                         break;
                     consumed = search.GetPosition(sequenceReader.Consumed);

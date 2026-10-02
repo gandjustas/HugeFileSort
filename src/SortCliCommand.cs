@@ -1,7 +1,8 @@
+using DotMake.CommandLine;
 using System.Diagnostics;
 using System.Globalization;
 using System.Text;
-using DotMake.CommandLine;
+using System.Threading.Channels;
 
 /// <summary>
 /// Команда sort: разбивает исходник на отсортированные чанки командой split и сливает их
@@ -40,10 +41,10 @@ internal partial class SortCliCommand
 
     private async Task<int> SortAsync(Encoding encoding, CompareOptions compareOptions, CancellationToken ct)
     {
-        var sw = Stopwatch.StartNew();
+        Stopwatch sw = Stopwatch.StartNew();
 
         // Параметры split-команды — из опций sort.
-        var split = new SplitCliCommand
+        SplitCliCommand split = new()
         {
             Source = Source,
             Parallelism = Parallelism,
@@ -52,15 +53,17 @@ internal partial class SortCliCommand
             MaxChunkMb = MaxChunkMb,
             ZstdLevel = ZstdLevel,
         };
-        var chunks = await split.SplitAsync(encoding, compareOptions, ct);
-        foreach (var file in chunks)
-            Console.WriteLine(file.FullName);
-        Console.WriteLine($"Chunks: {chunks.Count}");
+        var files = Channel.CreateUnbounded<FileInfo>();
+        await split.SplitAsync(encoding, compareOptions, files.Writer, ct);
+        var chunks = await files.Reader.ReadAllAsync(ct).ToArrayAsync(ct);
+
+        foreach (var file in chunks) Console.WriteLine(file.FullName);
+        Console.WriteLine($"Chunks: {chunks.Length}");
         Console.WriteLine(sw.Elapsed);
 
         // Параметры merge-команды: destination (или имя по умолчанию), порог сброса,
         // режим сравнения и преаллокация итогового файла по размеру исходника.
-        var merge = new MergeCliCommand
+        MergeCliCommand merge = new()
         {
             Destination = Destination ?? new FileInfo(Path.ChangeExtension(Source.FullName, ".sorted" + Path.GetExtension(Source.FullName))),
             FlushMb = FlushMb,

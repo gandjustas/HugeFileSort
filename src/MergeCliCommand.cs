@@ -51,17 +51,17 @@ internal partial class MergeCliCommand
     /// <summary>Мержит чанки в Destination с готовыми настройками; используется и командой sort.</summary>
     internal async Task MergeAsync(Encoding encoding, CompareOptions compareOptions, IReadOnlyList<FileInfo> chunkFiles, CancellationToken ct)
     {
-        var sw = Stopwatch.StartNew();
+        Stopwatch sw = Stopwatch.StartNew();
         var newLine = encoding.GetBytes(Environment.NewLine);
         var dotSpace = encoding.GetBytes(". ");
         var flushThreshold = FlushMb * 1024 * 1024;
         // Запись: Pipe позволяет циклу merge опережать диск на 2x flushThreshold.
-        var pipe = new Pipe(new PipeOptions(
+        Pipe pipe = new(new PipeOptions(
             minimumSegmentSize: 1 << 20,
             pauseWriterThreshold: (long)flushThreshold * 2,
             resumeWriterThreshold: flushThreshold,
             useSynchronizationContext: false));
-        using var output = new FileStream(Destination.FullName, FileMode.Create, FileAccess.Write, FileShare.None,
+        using FileStream output = new(Destination.FullName, FileMode.Create, FileAccess.Write, FileShare.None,
             bufferSize: 0, FileOptions.SequentialScan);
         if (PreallocatedLength is { } size)
             output.SetLength(size);
@@ -70,13 +70,13 @@ internal partial class MergeCliCommand
 
         // Продюсеры чанков: sort key пакетов считаются под глобальным CPU-слотом (=ProcessorCount),
         // чтобы суммарная CPU-работа не порождала больше активных потоков, чем ядер.
-        var cpuSlots = new SemaphoreSlim(Environment.ProcessorCount);
-        var channels = new Channel<Batch>[chunkFiles.Count];
-        var producers = new Task[chunkFiles.Count];
+        SemaphoreSlim cpuSlots = new(Environment.ProcessorCount);
+        Channel<Batch>[] channels = new Channel<Batch>[chunkFiles.Count];
+        Task[] producers = new Task[chunkFiles.Count];
         for (var i = 0; i < chunkFiles.Count; i++)
         {
             var file = chunkFiles[i];
-            var channel = Channel.CreateBounded<Batch>(new BoundedChannelOptions(2) { SingleWriter = true, SingleReader = true });
+            Channel<Batch> channel = Channel.CreateBounded<Batch>(new BoundedChannelOptions(2) { SingleWriter = true, SingleReader = true });
             channels[i] = channel;
             producers[i] = ProduceChunk(file, channel, cpuSlots, encoding, compareOptions, ct);
         }
@@ -132,11 +132,11 @@ internal partial class MergeCliCommand
     {
         try
         {
-            var fileStream = new FileStream(file.FullName, FileMode.Open, FileAccess.Read, FileShare.Read,
+            FileStream fileStream = new(file.FullName, FileMode.Open, FileAccess.Read, FileShare.Read,
                 bufferSize: 4 << 20, FileOptions.SequentialScan | FileOptions.Asynchronous);
 #if NET10_0
             // Backport .NET 11.0.4: ZstandardDecompressionOptions нет — лимит окна задаёт декодер.
-            await using var zstd = new ZstandardStream(fileStream, new ZstandardDecoder(31), leaveOpen: false);
+            await using ZstandardStream zstd = new(fileStream, new ZstandardDecoder(31), leaveOpen: false);
 #else
             // Окно сжатия чанков ограничено бюджетом (до 2^31) — разрешаем декодеру столько же.
             await using var zstd = new ZstandardStream(fileStream,
