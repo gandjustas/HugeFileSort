@@ -84,8 +84,7 @@ internal partial class MergeCliCommand
         Exception? mergeError = null;
         try
         {
-            var sources = channels.Zip(chunkFiles, (c, f) => (c, f))
-                .Select(pair => MergeExtensions.ReadEntries(pair.c.Reader, pair.f.Name, ct));
+            var sources = channels.Select(c => MergeExtensions.ReadEntries(c.Reader, ct));
             var number = new char[32];
             var writer = pipe.Writer;
             await foreach (var group in sources.MergeSorted(ChunkEntryComparer<long>.Instance, MergeGroup, ct).WithCancellation(ct).ConfigureAwait(false))
@@ -139,7 +138,7 @@ internal partial class MergeCliCommand
             await using var zstd = new ZstandardStream(fileStream,
                 new ZstandardDecompressionOptions { MaxWindowLog2 = 31 }, leaveOpen: false);
             await zstd.ProduceBatches(channel.Writer, encoding, CultureInfo.CurrentCulture.CompareInfo,
-                compareOptions, cpuSlots, BatchBytes, file.Name, ct).ConfigureAwait(false);
+                compareOptions, cpuSlots, BatchBytes, ct).ConfigureAwait(false);
         }
         catch (Exception ex)
         {

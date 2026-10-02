@@ -74,15 +74,12 @@ internal partial class SplitCliCommand
     internal async Task<List<FileInfo>> SplitAsync(Encoding encoding, CompareOptions compareOptions, CancellationToken ct)
     {
         Initialize(encoding, compareOptions);
-        Extensions.Trace("SplitAsync begin");
         var files = new ConcurrentQueue<FileInfo>();
 
         var sorter = new TransformBlock<Chunk<long>, Chunk<long>>(
             chunk =>
             {
-                Extensions.Trace($"sort begin: {chunk.KeyCount} keys");
                 SortChunk(chunk, ct);
-                Extensions.Trace("sort end");
                 return chunk;
             },
             new ExecutionDataflowBlockOptions
@@ -93,13 +90,7 @@ internal partial class SplitCliCommand
                 CancellationToken = ct,
             });
         var compressor = new TransformBlock<Chunk<long>, CompressedChunk>(
-            chunk =>
-            {
-                Extensions.Trace("compress begin");
-                var r = CompressChunk(chunk);
-                Extensions.Trace($"compress end: {r.Length >> 20}MB");
-                return r;
-            },
+            CompressChunk,
             new ExecutionDataflowBlockOptions
             {
                 MaxDegreeOfParallelism = 2,
@@ -113,11 +104,9 @@ internal partial class SplitCliCommand
         var saver = new ActionBlock<CompressedChunk>(
             chunk =>
             {
-                Extensions.Trace($"write begin: {chunk.Length >> 20}MB");
                 WriteChunk(in chunk);
                 chunk.Dispose();
                 files.Enqueue(chunk.File);
-                Extensions.Trace("write end");
             },
             new ExecutionDataflowBlockOptions
             {
@@ -142,7 +131,6 @@ internal partial class SplitCliCommand
         {
             await foreach (var chunk in SplitToChunks(pipe.Reader.Split(newLine, ct), bufferSize, ct).ConfigureAwait(false))
             {
-                Extensions.Trace($"parse: chunk {chunk.KeyCount} keys, used {chunk.Used >> 20}MB → send");
                 if (!await sorter.SendAsync(chunk, ct).ConfigureAwait(false))
                 {
                     // Конвейер остановился (сбой стадии) — буфер чанка больше никому не нужен.
@@ -150,7 +138,6 @@ internal partial class SplitCliCommand
                     break;
                 }
             }
-            Extensions.Trace("parse: done");
         }
         catch (Exception ex)
         {
@@ -223,29 +210,22 @@ internal partial class SplitCliCommand
     {
         try
         {
-            Extensions.Trace("read begin");
             using var fileStream = new FileStream(Source.FullName, FileMode.Open, FileAccess.Read, FileShare.Read,
                 bufferSize: 0, FileOptions.SequentialScan);
-            long total = 0;
             while (true)
             {
                 ct.ThrowIfCancellationRequested();
                 var span = writer.GetSpan(1 << 20);
                 var n = fileStream.Read(span);
                 if (n == 0) break;
-                total += n;
                 writer.Advance(n);
                 var r = writer.FlushAsync(ct).AsTask().GetAwaiter().GetResult();
                 if (r.IsCompleted) break;
-                if (total % (32 << 20) < (1 << 20))
-                    Extensions.Trace($"read: {total >> 20}MB");
             }
-            Extensions.Trace($"read done: {total >> 20}MB");
             writer.Complete();
         }
         catch (Exception ex)
         {
-            Extensions.Trace($"read failed: {ex.Message}");
             writer.Complete(ex);
         }
     }

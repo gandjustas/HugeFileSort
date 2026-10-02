@@ -23,14 +23,13 @@ static class MergeExtensions
         CompareOptions compareOptions,
         SemaphoreSlim cpuSlots,
         int batchBytes,
-        string label,
         CancellationToken ct) where T : IBinaryInteger<T>
     {
         var buffers = Channel.CreateBounded<(byte[] Buffer, int Filled, bool Eof)>(
             new BoundedChannelOptions(1) { SingleWriter = true, SingleReader = true });
         return Task.WhenAll(
             ReadChunks(stream, buffers.Writer, batchBytes, ct),
-            ComputeBatches<T>(buffers.Reader, channel, encoding, compareInfo, compareOptions, cpuSlots, batchBytes, label, ct));
+            ComputeBatches<T>(buffers.Reader, channel, encoding, compareInfo, compareOptions, cpuSlots, batchBytes, ct));
     }
 
     /// <summary>Читатель: наполняет буферы до конца (или eof) и передаёт вычислителю.</summary>
@@ -85,12 +84,10 @@ static class MergeExtensions
         CompareOptions compareOptions,
         SemaphoreSlim cpuSlots,
         int batchBytes,
-        string label,
         CancellationToken ct) where T : IBinaryInteger<T>
     {
         byte[]? pending = null; // хвост незавершённой записи прошлой порции
         var pendingLen = 0;
-        long entriesProduced = 0;
         try
         {
             while (true)
@@ -151,12 +148,10 @@ static class MergeExtensions
                 if (oldPending is not null)
                     ArrayPool<byte>.Shared.Return(oldPending);
 
-                entriesProduced += batch.Entries.Length;
                 await channel.WriteAsync(batch, ct).ConfigureAwait(false);
                 if (eof)
                     break; // eof-порция обработана — данных больше не будет
             }
-            Extensions.Trace($"[{label}] produced {entriesProduced} entries");
             channel.TryComplete();
         }
         catch (Exception ex)
@@ -296,22 +291,16 @@ static class MergeExtensions
     /// <summary>Адаптер канала пакетов к потоку записей для MergeSorted (Dispose каждой записи освобождает пакет).</summary>
     internal static async IAsyncEnumerable<ReadChunkEntry<T>> ReadEntries<T>(
         ChannelReader<Batch<T>> reader,
-        string label,
         [EnumeratorCancellation] CancellationToken ct = default) where T : IBinaryInteger<T>
     {
-        long consumed = 0;
         while (await reader.WaitToReadAsync(ct).ConfigureAwait(false))
         {
             while (reader.TryRead(out var batch))
             {
                 foreach (var entry in batch.Entries)
-                {
-                    consumed++;
                     yield return entry;
-                }
             }
         }
-        Extensions.Trace($"[{label}] consumed {consumed} entries");
     }
 
     public static async IAsyncEnumerable<V> MergeSorted<T,V>(

@@ -9,16 +9,6 @@ using MessagePack;
 
 static class Extensions
 {
-    // Трассировка стадий конвейера (stderr) — включается переменной окружения HFS_TRACE=1.
-    internal static readonly bool TraceEnabled = Environment.GetEnvironmentVariable("HFS_TRACE") == "1";
-    internal static readonly System.Diagnostics.Stopwatch TraceWatch = System.Diagnostics.Stopwatch.StartNew();
-
-    internal static void Trace(string message)
-    {
-        if (TraceEnabled)
-            Console.Error.WriteLine($"[{TraceWatch.Elapsed.TotalSeconds:F2}] {message}");
-    }
-
     public static async IAsyncEnumerable<T> DeserializeAsyncEnumerable<T>(
         this Stream stream,
         MessagePackSerializerOptions? options = null,
