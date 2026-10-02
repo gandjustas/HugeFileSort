@@ -408,7 +408,12 @@ internal partial class SplitCliCommand
             using var encoder = new ZstandardEncoder(new ZstandardCompressionOptions
             {
                 Quality = ZstdLevel,
+#if NET10_0
+                // Backport .NET 11.0.4: свойство переименовано из WindowLog2 в WindowLog.
+                WindowLog = Math.Min(windowLog2, Math.Clamp(BitOperations.Log2((uint)size) + 1, 20, 31)),
+#else
                 WindowLog2 = Math.Min(windowLog2, Math.Clamp(BitOperations.Log2((uint)size) + 1, 20, 31)),
+#endif
                 EnableLongDistanceMatching = true,
             });
             // Один вызов на весь чанк (isFinalBlock дописывает footer кадра).

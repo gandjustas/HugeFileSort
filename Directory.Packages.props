@@ -8,5 +8,6 @@
     <PackageVersion Include="Microsoft.Extensions.ObjectPool" Version="10.0.12" />
     <PackageVersion Include="DotMake.CommandLine" Version="3.7.0" />
     <PackageVersion Include="System.IO.Hashing" Version="10.0.3" />
+    <PackageVersion Include="SystemIOCompression.Zstandard.Backporting" Version="11.0.4" />
   </ItemGroup>
 </Project>

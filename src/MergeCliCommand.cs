@@ -134,9 +134,14 @@ internal partial class MergeCliCommand
         {
             var fileStream = new FileStream(file.FullName, FileMode.Open, FileAccess.Read, FileShare.Read,
                 bufferSize: 4 << 20, FileOptions.SequentialScan | FileOptions.Asynchronous);
+#if NET10_0
+            // Backport .NET 11.0.4: ZstandardDecompressionOptions нет — лимит окна задаёт декодер.
+            await using var zstd = new ZstandardStream(fileStream, new ZstandardDecoder(31), leaveOpen: false);
+#else
             // Окно сжатия чанков ограничено бюджетом (до 2^31) — разрешаем декодеру столько же.
             await using var zstd = new ZstandardStream(fileStream,
                 new ZstandardDecompressionOptions { MaxWindowLog2 = 31 }, leaveOpen: false);
+#endif
             await zstd.ProduceBatches(channel.Writer, encoding, CultureInfo.CurrentCulture.CompareInfo,
                 compareOptions, cpuSlots, BatchBytes, ct).ConfigureAwait(false);
         }
