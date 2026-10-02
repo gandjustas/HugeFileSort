@@ -1,6 +1,5 @@
 using System.Buffers;
 using System.Collections.Concurrent;
-using System.Diagnostics;
 using System.Globalization;
 using System.IO.Compression;
 using System.IO.Pipelines;
@@ -9,23 +8,18 @@ using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading.Tasks.Dataflow;
+using DotMake.CommandLine;
 using Microsoft.Extensions.ObjectPool;
 
 /// <summary>
-/// Фаза разбиения: читает исходник, собирает строки в чанки (текст — ключ словаря, числа — списки),
-/// сортирует чанки и пишет отсортированные промежуточные файлы со сжатием zstd.
-/// Конвейер со стадиями наперёд (backpressure приходит только от записи на диск):
+/// Команда split и конвейер разбиения: читает исходник, собирает строки в чанки (текст — ключ
+/// словаря, числа — списки), сортирует чанки и пишет отсортированные промежуточные файлы со
+/// сжатием zstd. Конвейер со стадиями наперёд (backpressure приходит только от записи на диск):
 /// чтение выделенным потоком (sync FileStream → Pipe) → разбор строк → сортировка чанков
 /// (TransformBlock) → сериализация + one-shot zstd (TransformBlock) → запись файла (ActionBlock).
 /// </summary>
-class SplitSort<T>(
-    FileInfo source,
-    Encoding encoding,
-    CompareOptions compareOptions,
-    int sortParallelism,
-    int minChunkMb,
-    int maxChunkMb,
-    int zstdLevel) where T : IBinaryInteger<T>
+[CliCommand(Parent = typeof(RootCliCommand), Description = "Split a huge file into sorted chunk files, printing their paths to stdout")]
+internal partial class SplitCliCommand
 {
     // Граница stackalloc для копий текста строки; больше — аренда из пула, чтобы не переполнить стек.
     private const int StackallocByteThreshold = 16 * 1024;
@@ -33,43 +27,57 @@ class SplitSort<T>(
     // Граница stackalloc для декодирующего char-буфера числа.
     private const int StackallocCharThreshold = 512;
 
-    readonly FileInfo source = source;
-    readonly Encoding encoding = encoding;
-    readonly byte[] newLine = encoding.GetBytes(Environment.NewLine);
-    readonly byte[] dotSpace = encoding.GetBytes(". ");
-    readonly CompareInfo compareInfo = CultureInfo.CurrentCulture.CompareInfo;
-    readonly CompareOptions compareOptions = compareOptions;
-    readonly bool isUtf8 = encoding.WebName == "utf-8";
-    readonly bool isOrdinal = compareOptions == CompareOptions.Ordinal;
-    readonly int bufferSize = ComputeBufferSize(source.Length, minChunkMb, maxChunkMb);
-    readonly int zstdLevel = zstdLevel;
-    // Бюджет окна zstd: merge декодирует все чанки одновременно, окно каждого кадра выделяется
-    // декодером целиком — ограничиваем суммарную память (~2ГБ) долей на один чанк.
-    readonly int windowLog2 = ComputeWindowLog2(source.Length, ComputeBufferSize(source.Length, minChunkMb, maxChunkMb));
-    readonly ArrayPool<byte> arrayPool = ArrayPool<byte>.Shared;
-    readonly ObjectPool<Dictionary<BufferString, KeyInfo>> dictionaryPool = new DefaultObjectPool<Dictionary<BufferString, KeyInfo>>(new LookupPoolPolicy());
+    [CliArgument(Description = "Source file to split", ValidationRules = CliValidationRules.ExistingFile)]
+    public FileInfo Source { get; set; } = null!;
 
-    /// <summary>Адаптивный буфер чанка: большой файл — крупные чанки (меньше накладных расходов merge), маленький — мелкие (больше параллелизма).</summary>
-    private static int ComputeBufferSize(long fileLength, int minChunkMb, int maxChunkMb) =>
-        (int)Math.Clamp(fileLength / (Environment.ProcessorCount * 2L), minChunkMb * 1024L * 1024L, maxChunkMb * 1024L * 1024L);
+    [CliOption(Name = "parallel", Description = "Number of chunks sorted in parallel (default: 1)")]
+    public int Parallelism { get; set; } = 1;
 
-    /// <summary>Логарифм окна zstd: не больше размера чанка и в бюджете ~2ГБ на все параллельные декодеры merge.</summary>
-    private static int ComputeWindowLog2(long fileLength, int chunkBufferBytes)
+    [CliOption(Name = "compare-options", Description = "Text comparison: None (default), Ordinal, IgnoreCase, IgnoreNonSpace, IgnoreSymbols, or a combination")]
+    public string CompareOptionsName { get; set; } = "None";
+
+    [CliOption(Name = "min-chunk-mb", Description = "Lower bound of the adaptive chunk buffer, MB (default: 32)")]
+    public int MinChunkMb { get; set; } = 32;
+
+    [CliOption(Name = "max-chunk-mb", Description = "Upper bound of the adaptive chunk buffer, MB (default: 500)")]
+    public int MaxChunkMb { get; set; } = 500;
+
+    [CliOption(Name = "zstd-level", Description = "Zstd compression level for chunk files, 1-22 (default: 9)")]
+    public int ZstdLevel { get; set; } = 9;
+
+    // ——— Состояние конвейера; инициализируется Initialize перед прогоном ———
+    private Encoding encoding = null!;
+    private CompareInfo compareInfo = null!;
+    private CompareOptions compareOptions;
+    private bool isUtf8;
+    private bool isOrdinal;
+    private byte[] newLine = null!;
+    private byte[] dotSpace = null!;
+    private int bufferSize;
+    private int windowLog2;
+    private int savedChunkCount;
+    private readonly ArrayPool<byte> arrayPool = ArrayPool<byte>.Shared;
+    private readonly ObjectPool<Dictionary<BufferString, KeyInfo>> dictionaryPool = new DefaultObjectPool<Dictionary<BufferString, KeyInfo>>(new LookupPoolPolicy());
+
+    public Task<int> RunAsync(CliContext context) =>
+        RootCliCommand.RunWithSettingsAsync(CompareOptionsName, (encoding, compareOptions, ct) => ExecuteAsync(encoding, compareOptions, ct), context);
+
+    private async Task<int> ExecuteAsync(Encoding encoding, CompareOptions compareOptions, CancellationToken ct)
     {
-        var chunkCount = Math.Max(1, fileLength / chunkBufferBytes);
-        var perStream = 2L * 1024 * 1024 * 1024 / chunkCount;
-        return Math.Clamp(BitOperations.Log2((uint)Math.Max(1, perStream)), 20, 31);
+        var files = await SplitAsync(encoding, compareOptions, ct);
+        foreach (var file in files)
+            Console.WriteLine(file.FullName);
+        return 0;
     }
 
-    /// <summary>
-    /// Прогоняет конвейер разбиения и возвращает пути созданных промежуточных файлов (порядок не важен).
-    /// </summary>
-    public async Task<List<FileInfo>> RunAsync(CancellationToken ct)
+    /// <summary>Запускает конвейер разбиения с готовыми настройками; используется и командой sort.</summary>
+    internal async Task<List<FileInfo>> SplitAsync(Encoding encoding, CompareOptions compareOptions, CancellationToken ct)
     {
-        Extensions.Trace("RunAsync begin");
+        Initialize(encoding, compareOptions);
+        Extensions.Trace("SplitAsync begin");
         var files = new ConcurrentQueue<FileInfo>();
 
-        var sorter = new TransformBlock<Chunk<T>, Chunk<T>>(
+        var sorter = new TransformBlock<Chunk<long>, Chunk<long>>(
             chunk =>
             {
                 Extensions.Trace($"sort begin: {chunk.KeyCount} keys");
@@ -79,12 +87,12 @@ class SplitSort<T>(
             },
             new ExecutionDataflowBlockOptions
             {
-                MaxDegreeOfParallelism = sortParallelism,
-                BoundedCapacity = sortParallelism + 2,
+                MaxDegreeOfParallelism = Parallelism,
+                BoundedCapacity = Parallelism + 2,
                 EnsureOrdered = false,
                 CancellationToken = ct,
             });
-        var compressor = new TransformBlock<Chunk<T>, CompressedChunk>(
+        var compressor = new TransformBlock<Chunk<long>, CompressedChunk>(
             chunk =>
             {
                 Extensions.Trace("compress begin");
@@ -181,13 +189,42 @@ class SplitSort<T>(
         return result;
     }
 
+    /// <summary>
+    /// Инициализирует состояние конвейера из опций команды и настроек кодировки/сравнения.
+    /// Вызывается перед каждым прогоном (и командой probe-split — без запуска конвейера).
+    /// </summary>
+    internal void Initialize(Encoding encoding, CompareOptions compareOptions)
+    {
+        this.encoding = encoding;
+        this.compareOptions = compareOptions;
+        compareInfo = CultureInfo.CurrentCulture.CompareInfo;
+        isUtf8 = encoding.WebName == "utf-8";
+        isOrdinal = compareOptions == CompareOptions.Ordinal;
+        newLine = encoding.GetBytes(Environment.NewLine);
+        dotSpace = encoding.GetBytes(". ");
+        bufferSize = ComputeBufferSize(Source.Length, MinChunkMb, MaxChunkMb);
+        windowLog2 = ComputeWindowLog2(Source.Length, bufferSize);
+    }
+
+    /// <summary>Адаптивный буфер чанка: большой файл — крупные чанки (меньше накладных расходов merge), маленький — мелкие (больше параллелизма).</summary>
+    private static int ComputeBufferSize(long fileLength, int minChunkMb, int maxChunkMb) =>
+        (int)Math.Clamp(fileLength / (Environment.ProcessorCount * 2L), minChunkMb * 1024L * 1024L, maxChunkMb * 1024L * 1024L);
+
+    /// <summary>Логарифм окна zstd: не больше размера чанка и в бюджете ~2ГБ на все параллельные декодеры merge.</summary>
+    private static int ComputeWindowLog2(long fileLength, int chunkBufferBytes)
+    {
+        var chunkCount = Math.Max(1, fileLength / chunkBufferBytes);
+        var perStream = 2L * 1024 * 1024 * 1024 / chunkCount;
+        return Math.Clamp(BitOperations.Log2((uint)Math.Max(1, perStream)), 20, 31);
+    }
+
     /// <summary>Продюсер чтения файла: sync-чтение блоками readSize в пайп (выделенный поток).</summary>
     private void FillPipe(PipeWriter writer, CancellationToken ct)
     {
         try
         {
             Extensions.Trace("read begin");
-            using var fileStream = new FileStream(source.FullName, FileMode.Open, FileAccess.Read, FileShare.Read,
+            using var fileStream = new FileStream(Source.FullName, FileMode.Open, FileAccess.Read, FileShare.Read,
                 bufferSize: 0, FileOptions.SequentialScan);
             long total = 0;
             while (true)
@@ -217,9 +254,9 @@ class SplitSort<T>(
     /// Собирает строки в чанки: байты текста строки — ключ Dictionary (ArraySegment в буфере чанка,
     /// сравнение по байтам), число — элемент списка. Повторный текст добавляет число в список существующего ключа.
     /// </summary>
-    private async IAsyncEnumerable<Chunk<T>> SplitToChunks(IAsyncEnumerable<ReadOnlySequence<byte>> lines, int bufferSize, [EnumeratorCancellation] CancellationToken ct = default)
+    internal async IAsyncEnumerable<Chunk<long>> SplitToChunks(IAsyncEnumerable<ReadOnlySequence<byte>> lines, int bufferSize, [EnumeratorCancellation] CancellationToken ct = default)
     {
-        Chunk<T> chunk = new(dictionaryPool, bufferSize);
+        Chunk<long> chunk = new(dictionaryPool, bufferSize);
         await foreach (var line in lines.WithCancellation(ct).ConfigureAwait(false))
         {
             SequenceReader<byte> reader = new(line);
@@ -247,22 +284,22 @@ class SplitSort<T>(
     }
 
     /// <summary>
-    /// Преобразует байты числа в T. Для utf-8 — парсинг байт напрямую,
+    /// Преобразует байты числа в long. Для utf-8 — парсинг байт напрямую,
     /// для остальных кодировок — сперва декодирование в char.
     /// </summary>
-    private T ParseNumber(ReadOnlySpan<byte> bytes) =>
-        isUtf8 ? T.Parse(bytes, null) : DecodeAndParse(bytes);
+    private long ParseNumber(ReadOnlySpan<byte> bytes) =>
+        isUtf8 ? long.Parse(bytes, null) : DecodeAndParse(bytes);
 
-    private T DecodeAndParse(ReadOnlySpan<byte> bytes)
+    private long DecodeAndParse(ReadOnlySpan<byte> bytes)
     {
         Span<char> chars = bytes.Length <= StackallocCharThreshold
             ? stackalloc char[StackallocCharThreshold]
             : new char[encoding.GetMaxCharCount(bytes.Length)];
         var written = encoding.GetChars(bytes, chars);
-        return T.Parse(chars[..written], null);
+        return long.Parse(chars[..written], null);
     }
 
-    private void AddToChunk(Chunk<T> chunk, T x, ReadOnlySequence<byte> text)
+    private void AddToChunk(Chunk<long> chunk, long x, ReadOnlySequence<byte> text)
     {
         byte[]? rented = null;
         try
@@ -284,7 +321,7 @@ class SplitSort<T>(
     /// параллельно — sort key по ключам и сортировка CSR-диапазонов; порядок записи — по sort key.
     /// Ordinal-режим: sort key не вычисляются, порядок — по байтам текста.
     /// </summary>
-    private void SortChunk(Chunk<T> chunk, CancellationToken ct)
+    private void SortChunk(Chunk<long> chunk, CancellationToken ct)
     {
         var keyCount = chunk.KeyCount;
         var maxKeyBytes = chunk.TextLengths.Count > 0 ? chunk.TextLengths.Max() : 0;
@@ -373,10 +410,10 @@ class SplitSort<T>(
     /// Order (memcpy текстов + varint-заголовки), one-shot zstd S → C. Буфер текстов чанка
     /// освобождается сразу после сериализации, до сжатия.
     /// </summary>
-    private unsafe CompressedChunk CompressChunk(Chunk<T> chunk)
+    private unsafe CompressedChunk CompressChunk(Chunk<long> chunk)
     {
         var index = Interlocked.Increment(ref savedChunkCount) - 1;
-        var chunkFile = new FileInfo(Path.ChangeExtension(source.FullName, $".chunk-{index:D3}{Path.GetExtension(source.FullName)}"));
+        var chunkFile = new FileInfo(Path.ChangeExtension(Source.FullName, $".chunk-{index:D3}{Path.GetExtension(Source.FullName)}"));
         byte* s = null;
         byte* c = null;
         try
@@ -390,7 +427,7 @@ class SplitSort<T>(
             c = (byte*)NativeMemory.AlignedAlloc((nuint)cLength, 64);
             using var encoder = new ZstandardEncoder(new ZstandardCompressionOptions
             {
-                Quality = zstdLevel,
+                Quality = ZstdLevel,
                 WindowLog2 = Math.Min(windowLog2, Math.Clamp(BitOperations.Log2((uint)size) + 1, 20, 31)),
                 EnableLongDistanceMatching = true,
             });
@@ -410,14 +447,13 @@ class SplitSort<T>(
             throw;
         }
     }
-    private int savedChunkCount;
 
     /// <summary>
     /// Сериализует отсортированный чанк (формат v3, все числа — LEB128 varint):
     /// varint(длина текста), текст, varint(количество чисел), varint(разности чисел) — для каждого
     /// ключа в порядке Order. Sort key в файл не пишутся — merge пересчитывает их пакетами.
     /// </summary>
-    private static void SerializeChunk(Chunk<T> chunk, Span<byte> dst)
+    private static void SerializeChunk(Chunk<long> chunk, Span<byte> dst)
     {
         var textOffsets = chunk.TextOffsets!;
         var values = chunk.Values!;
@@ -433,7 +469,7 @@ class SplitSort<T>(
             var start = csr[i];
             var count = csr[i + 1] - start;
             pos = Extensions.WriteVarint(dst, pos, (ulong)count);
-            T previous = T.Zero;
+            long previous = 0;
             for (var j = start; j < start + count; j++)
             {
                 pos = Extensions.WriteVarint(dst, pos, ulong.CreateChecked(values[j] - previous));
@@ -454,7 +490,7 @@ class SplitSort<T>(
     }
 
     /// <summary>Точный несжатый размер файла чанка до сериализации — для аллокации буфера S.</summary>
-    private static long ComputeChunkSize(Chunk<T> chunk)
+    private static long ComputeChunkSize(Chunk<long> chunk)
     {
         var textOffsets = chunk.TextOffsets!;
         var csr = chunk.CsrOffsets!;
@@ -465,7 +501,7 @@ class SplitSort<T>(
             var textLen = textOffsets[i + 1] - textOffsets[i];
             var count = csr[i + 1] - csr[i];
             total += VarintSize((ulong)textLen) + textLen + VarintSize((ulong)count);
-            T previous = T.Zero;
+            long previous = 0;
             for (var j = csr[i]; j < csr[i + 1]; j++)
             {
                 var delta = ulong.CreateChecked(values[j] - previous);
@@ -477,6 +513,4 @@ class SplitSort<T>(
     }
 
     private static int VarintSize(ulong value) => 1 + (int)(BitOperations.Log2(value | 1) / 7);
-
-    // Трассировка стадий конвейера (stderr) — включается переменной окружения HFS_TRACE=1.
 }
