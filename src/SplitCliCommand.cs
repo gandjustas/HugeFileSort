@@ -1,15 +1,12 @@
 using System.Buffers;
 using System.Collections.Concurrent;
 using System.Globalization;
-using System.IO.Compression;
 using System.IO.Pipelines;
 using System.Numerics;
 using System.Runtime.CompilerServices;
-using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading.Tasks.Dataflow;
 using DotMake.CommandLine;
-using Microsoft.Extensions.ObjectPool;
 using System.Threading.Channels;
 
 /// <summary>
@@ -58,9 +55,8 @@ internal partial class SplitCliCommand
     private int bufferSize;
     private int windowLog2;
     private int savedChunkCount;
-    private ChunkBufferPool bufferPool = null!;
+    private ChunkPools pools = null!;
     private readonly ArrayPool<byte> arrayPool = ArrayPool<byte>.Shared;
-    private readonly ObjectPool<Dictionary<BufferString, KeyInfo>> dictionaryPool = new DefaultObjectPool<Dictionary<BufferString, KeyInfo>>(new LookupPoolPolicy());
 
     public Task<int> RunAsync(CliContext context) =>
         RootCliCommand.RunWithSettingsAsync(CompareOptionsName, ExecuteAsync, context);
@@ -91,10 +87,10 @@ internal partial class SplitCliCommand
         dotSpace = encoding.GetBytes(". ");
         bufferSize = ComputeBufferSize(Source.Length, MinChunkMb, MaxChunkMb);
         windowLog2 = ComputeWindowLog2(Source.Length, bufferSize);
-        bufferPool = new ChunkBufferPool(bufferSize);
+        pools = new ChunkPools(bufferSize, Math.Max(Parallelism, 4));
 
         TransformBlock<Chunk, SortedChunk> sorter = new(
-            chunk => SortChunk(chunk, ct),
+            chunk => chunk.Sort(encoding, compareInfo, compareOptions, isOrdinal, ct),
             new ()
             {
                 MaxDegreeOfParallelism = Parallelism,
@@ -103,7 +99,7 @@ internal partial class SplitCliCommand
                 CancellationToken = ct,
             });
         TransformBlock<SortedChunk, CompressedChunk> compressor = new(
-            CompressChunk,
+            sorted => sorted.Compress(NextChunkFile(), ZstdLevel, windowLog2),
             new ()
             {
                 MaxDegreeOfParallelism = 2,
@@ -114,7 +110,7 @@ internal partial class SplitCliCommand
         ActionBlock<CompressedChunk> saver = new(
             async chunk =>
             {
-                WriteChunk(in chunk);
+                WriteChunk(chunk);
                 chunk.Dispose();
                 await files.WriteAsync(chunk.File, ct);
             },
@@ -129,7 +125,9 @@ internal partial class SplitCliCommand
         using var compressorToSaver = compressor.LinkTo(saver, new DataflowLinkOptions { PropagateCompletion = true });
 
         // Чтение исходника выделенным потоком: sync FileStream → Pipe (опережение разбора на 8-16 МБ).
+        // Сегменты Pipe берутся из общего Scratch-пула.
         Pipe pipe = new(new PipeOptions(
+            pool: pools.Memory,
             minimumSegmentSize: ReadBufferSize,
             resumeWriterThreshold: ReadBufferSize * 8,
             pauseWriterThreshold: ReadBufferSize * 16,
@@ -142,10 +140,11 @@ internal partial class SplitCliCommand
         var completed = await SplitToChunks(lines, ct)
             .AllAsync((c, ct) => new ValueTask<bool>(sorter.SendAsync(c, ct)), ct)
             .ConfigureAwait(false);
+            sorter.Complete();
+            // Реальное исключение упавшей стадии выйдет отсюда.
+            await Task.WhenAll(fill, sorter.Completion, compressor.Completion, saver.Completion);
             if (!completed)
                 throw new InvalidOperationException("Sorter stopped accepting chunks (pipeline faulted)");
-            sorter.Complete();
-            await Task.WhenAll(fill, sorter.Completion, compressor.Completion, saver.Completion);
         }
         finally
         {
@@ -205,7 +204,7 @@ internal partial class SplitCliCommand
     /// </summary>
     internal async IAsyncEnumerable<Chunk> SplitToChunks(IAsyncEnumerable<ReadOnlySequence<byte>> lines, [EnumeratorCancellation] CancellationToken ct = default)
     {
-        Chunk chunk = new(dictionaryPool, bufferPool);
+        Chunk chunk = new(pools);
         await foreach (var line in lines.WithCancellation(ct).ConfigureAwait(false))
         {
             SequenceReader<byte> reader = new(line);
@@ -225,7 +224,7 @@ internal partial class SplitCliCommand
             // Предыдущий словарь переполнился, выдаем словарь наружу, создаем новый и добавляем текст в него.
 
             yield return chunk;
-            chunk = new(dictionaryPool, bufferPool);
+            chunk = new(pools);
             AddToChunk(chunk, x, text);
         }
         if (chunk is { Lookup.Count: 0 }) chunk.Dispose();
@@ -265,140 +264,23 @@ internal partial class SplitCliCommand
         }
     }
 
-    /// <summary>
-    /// Переход накопление → сортировка: CSR значений из пар, параллельные пассы sort key
-    /// (локальный нативный буфер, освобождается здесь же), порядок записи. Словарь возвращается
-    /// в пул, текстовый буфер передаётся в SortedChunk.
-    /// </summary>
-    private unsafe SortedChunk SortChunk(Chunk chunk, CancellationToken ct)
-    {
-        var keyCount = chunk.KeyCount;
-        var maxKeyBytes = chunk.TextLengths.Count > 0 ? chunk.TextLengths.Max() : 0;
-        var maxChars = encoding.GetMaxCharCount(maxKeyBytes);
-        // Смещения текстов: тексты лежат в буфере подряд в порядке номеров.
-        var textOffsets = new int[keyCount + 1];
-        for (var i = 0; i < keyCount; i++)
-            textOffsets[i + 1] = textOffsets[i] + chunk.TextLengths[i];
-
-        int[] sortKeyOffsets = [];
-        int[] sortKeyLengths = [];
-        byte* sortKeyBuffer = null;
-        ParallelOptions parallelOptions = new() { CancellationToken = ct };
-
-        if (!isOrdinal)
-        {
-            // Пасс A (параллельно): точная длина sort key каждого ключа.
-            var sortKeyLengthsByNumber = new int[keyCount];
-            Parallel.For(0, keyCount, parallelOptions,
-                () => new char[maxChars],
-                (i, _, buf) =>
-                {
-                    var w = encoding.GetChars(chunk.BufferSpan.Slice(textOffsets[i], chunk.TextLengths[i]), buf);
-                    sortKeyLengthsByNumber[i] = compareInfo.GetSortKeyLength(buf.AsSpan(0, w), compareOptions);
-                    return buf;
-                },
-                _ => { });
-
-            var totalSortKey = 0;
-            for (var i = 0; i < keyCount; i++)
-                totalSortKey += sortKeyLengthsByNumber[i];
-            sortKeyBuffer = (byte*)NativeMemory.AlignedAlloc((nuint)Math.Max(16, totalSortKey), 64);
-            sortKeyOffsets = new int[keyCount + 1];
-            for (var i = 0; i < keyCount; i++)
-                sortKeyOffsets[i + 1] = sortKeyOffsets[i] + sortKeyLengthsByNumber[i];
-            sortKeyLengths = sortKeyLengthsByNumber;
-        }
-
-        (var values, var csr) = chunk.BuildCsr();
-
-        // Параллельно: sort key каждого ключа (culture) и сортировка его CSR-диапазона.
-        Parallel.For(0, keyCount, parallelOptions,
-            () => new char[maxChars],
-            (i, _, buf) =>
-            {
-                if (!isOrdinal)
-                {
-                    var w = encoding.GetChars(chunk.BufferSpan[textOffsets[i]..textOffsets[i + 1]], buf);
-                    compareInfo.GetSortKey(buf.AsSpan(0, w), new Span<byte>(sortKeyBuffer + sortKeyOffsets[i], sortKeyLengths[i]), compareOptions);
-                }
-                Array.Sort(values, csr[i], csr[i + 1] - csr[i]);
-                return buf;
-            },
-            _ => { });
-
-        // Порядок записи: номера ключей по возрастанию sort key (ordinal — по байтам текста).
-        var order = Enumerable.Range(0, keyCount).ToArray();
-        var indices = new BufferString[keyCount];
-        for (var i = 0; i < keyCount; i++)
-            indices[i] = isOrdinal
-                ? new BufferString(textOffsets[i], textOffsets[i + 1] - textOffsets[i])
-                : new BufferString(sortKeyOffsets[i], sortKeyLengths[i]);
-        if (isOrdinal)
-            Array.Sort(indices, order, chunk.Comparer);
-        else
-            Array.Sort(indices, order, new NativeSegmentComparer(sortKeyBuffer));
-
-        // Sort key нужен только для сортировки порядка — освобождается здесь же.
-        if (sortKeyBuffer is not null)
-            NativeMemory.AlignedFree(sortKeyBuffer);
-
-        // Словарь возвращается в пул, текстовый буфер передаётся следующей стадии.
-        chunk.ReleaseLookup();
-        return new SortedChunk(chunk.DetachBuffer(), bufferPool, values, csr, textOffsets, order);
-    }
-
-    /// <summary>
-    /// Переход сортировка → сжатие: сериализация в буфер S точного размера (текстовый буфер
-    /// возвращается в пул сразу после неё), one-shot zstd S → C.
-    /// </summary>
-    private unsafe CompressedChunk CompressChunk(SortedChunk sorted)
+    /// <summary>Имя файла очередного чанка.</summary>
+    private FileInfo NextChunkFile()
     {
         var index = Interlocked.Increment(ref savedChunkCount) - 1;
-        FileInfo chunkFile = new(Path.ChangeExtension(Source.FullName, $".chunk-{index:D3}{Path.GetExtension(Source.FullName)}"));
-        byte* s = null;
-        byte* c = null;
-        try
-        {
-            var size = sorted.SerializedSize();
-            s = (byte*)NativeMemory.AlignedAlloc((nuint)Math.Max(16, size), 64);
-            sorted.Serialize(new Span<byte>(s, checked((int)size)));
-            sorted.Dispose(); // текстовый буфер возвращается в пул до сжатия
-
-            var cLength = checked((int)ZstandardEncoder.GetMaxCompressedLength(size));
-            c = (byte*)NativeMemory.AlignedAlloc((nuint)cLength, 64);
-            using ZstandardEncoder encoder = new(new ZstandardCompressionOptions
-            {
-                Quality = ZstdLevel,
-                WindowLog = Math.Min(windowLog2, Math.Clamp(BitOperations.Log2((uint)size) + 1, 20, 31)),
-                EnableLongDistanceMatching = true,
-            });
-            // Один вызов на весь чанк (isFinalBlock дописывает footer кадра).
-            var status = encoder.Compress(new ReadOnlySpan<byte>(s, checked((int)size)), new Span<byte>(c, cLength),
-                out var consumed, out var written, isFinalBlock: true);
-            if (status != OperationStatus.Done || consumed != size)
-                throw new InvalidOperationException($"zstd compression incomplete: {status}, {consumed} of {size}");
-            NativeMemory.AlignedFree(s);
-            s = null;
-            return new CompressedChunk(chunkFile, c, written);
-        }
-        catch
-        {
-            if (s is not null) NativeMemory.AlignedFree(s);
-            if (c is not null) NativeMemory.AlignedFree(c);
-            throw;
-        }
+        return new FileInfo(Path.ChangeExtension(Source.FullName, $".chunk-{index:D3}{Path.GetExtension(Source.FullName)}"));
     }
 
     /// <summary>Пишет сжатый чанк на диск одним Write (преаллокация точного размера — без расширения по кусочкам).</summary>
-    private static unsafe void WriteChunk(in CompressedChunk chunk)
+    private static void WriteChunk(CompressedChunk chunk)
     {
         using FileStream fileStream = new(
-            chunk.File.FullName, 
+            chunk.File.FullName,
             FileMode.Create, FileAccess.Write, FileShare.None,
-            bufferSize: 0, 
+            bufferSize: 0,
             FileOptions.SequentialScan
             );
         fileStream.SetLength(chunk.Length);
-        fileStream.Write(new ReadOnlySpan<byte>(chunk.Buffer, chunk.Length));
+        fileStream.Write(chunk.Buffer.AsSpan(0, chunk.Length));
     }
 }
