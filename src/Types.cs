@@ -1,5 +1,7 @@
 using System.Buffers;
+using System.Collections.Concurrent;
 using System.Globalization;
+using System.Numerics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -76,6 +78,26 @@ sealed unsafe class NativeSegmentComparer(byte* buffer) : IComparer<BufferString
 }
 
 /// <summary>
+/// Пул нативных текстовых буферов чанка фиксированного размера (64-байтное выравнивание).
+/// Все чанки прогона имеют одинаковый размер — буферы переиспользуются между стадиями
+/// накопления, сортировки и сериализации вместо реаллокации.
+/// </summary>
+sealed unsafe class ChunkBufferPool
+{
+    private readonly ConcurrentBag<nuint> buffers = [];
+
+    public ChunkBufferPool(int bufferSize) => BufferSize = bufferSize;
+
+    public int BufferSize { get; }
+
+    public byte* Rent() => buffers.TryTake(out var buffer)
+        ? (byte*)buffer
+        : (byte*)NativeMemory.AlignedAlloc((nuint)BufferSize, 64);
+
+    public void Return(byte* buffer) => buffers.Add((nuint)buffer);
+}
+
+/// <summary>
 /// Запись промежуточного файла при merge: текст и sort key — сегменты буферов пакета (Batch),
 /// значения — срез общего массива значений пакета. Dispose уменьшает счётчик пакета: последний
 /// возврат возвращает буферы пакета в пулы (MergeSorted делает это после потребления группы).
@@ -141,7 +163,7 @@ unsafe struct CompressedChunk(FileInfo file, byte* buffer, int length) : IDispos
     public byte* Buffer = buffer;
     public readonly int Length = length;
 
-    public unsafe void Dispose()
+    public void Dispose()
     {
         if (Buffer is not null)
             NativeMemory.AlignedFree(Buffer);
@@ -175,41 +197,37 @@ sealed class LookupPoolPolicy : IPooledObjectPolicy<Dictionary<BufferString, Key
 }
 
 /// <summary>
-/// Чанк: фаза разбиения — нативный буфер текстов (ключи Dictionary ссылаются через BufferString),
-/// словарь (байты текста → номер ключа + количество значений) и один список пар (номер, значение);
-/// после finalize — нативный буфер sort key, CSR-массив значений и порядок записи.
-/// Dispose освобождает нативную память, массивы — GC.
+/// Стадия накопления чанка: нативный буфер текстов (берётся из пула и передаётся дальше по
+/// DetachBuffer), словарь из пула (байты текста → номер ключа) и список пар (номер, значение).
 /// </summary>
 sealed unsafe class Chunk : IDisposable
 {
-    private readonly byte* buffer;
+    private byte* buffer;
     private readonly int bufferLength;
     private readonly ObjectPool<Dictionary<BufferString, KeyInfo>> dictionaryPool;
+    private readonly ChunkBufferPool bufferPool;
+    private readonly Dictionary<BufferString, KeyInfo> lookup;
+    private readonly BytesComparer comparer;
+    private readonly Dictionary<BufferString, KeyInfo>.AlternateLookup<ReadOnlySpan<byte>> alt;
+    private readonly List<(int Number, long Value)> pairs = [];
+    private readonly List<int> textLengths = [];
+    private bool lookupReleased;
 
     public Chunk(
         ObjectPool<Dictionary<BufferString, KeyInfo>> dictionaryPool,
-        int bufferSize)
+        ChunkBufferPool bufferPool)
     {
         this.dictionaryPool = dictionaryPool;
-        buffer = (byte*)NativeMemory.AlignedAlloc((nuint)bufferSize, 64);
-        bufferLength = bufferSize;
+        this.bufferPool = bufferPool;
         // Один dictionaryPool.Get() на все три поля: comparer и alternate lookup обязаны
         // принадлежать тому же словарю, что и lookup.
         lookup = dictionaryPool.Get();
         comparer = (BytesComparer)lookup.Comparer;
+        buffer = bufferPool.Rent();
+        bufferLength = bufferPool.BufferSize;
         comparer.Bind(buffer, bufferLength);
         alt = lookup.GetAlternateLookup<ReadOnlySpan<byte>>();
     }
-    private readonly Dictionary<BufferString, KeyInfo> lookup;
-    private readonly BytesComparer comparer;
-    private readonly Dictionary<BufferString, KeyInfo>.AlternateLookup<ReadOnlySpan<byte>> alt;
-
-    private readonly List<(int Number, long Value)> pairs = [];
-    private readonly List<int> textLengths = [];
-
-    private byte* sortKeyBuffer;
-    private int sortKeyLength;
-    private bool lookupReleased;
 
     /// <summary>Нативный буфер текстов ключей (лежат подряд в порядке номеров).</summary>
     public Span<byte> BufferSpan => new(buffer, bufferLength);
@@ -219,35 +237,20 @@ sealed unsafe class Chunk : IDisposable
     /// <summary>Компарер ключей, привязанный к буферу чанка (используется и для ordinal-сортировки).</summary>
     public BytesComparer Comparer => comparer;
 
-    /// <summary>Ключи, упорядоченные по строковому сравнению; заполняется фазой сортировки.</summary>
-    public int[]? Order { get; internal set; }
-
-    /// <summary>CSR-массив значений после finalize.</summary>
-    public long[]? Values { get; internal set; }
-
-    /// <summary>Границы диапазонов значений по номерам ключей (длина K+1).</summary>
-    public int[]? CsrOffsets { get; internal set; }
-
-    /// <summary>Длины sort key по номерам ключей.</summary>
-    public int[]? SortKeyLengths { get; internal set; }
-
-    /// <summary>Смещения sort key по номерам ключей.</summary>
-    public int[]? SortKeyOffsets { get; internal set; }
-
-    /// <summary>Смещения текстов по номерам ключей.</summary>
-    public int[]? TextOffsets { get; internal set; }
-
     /// <summary>Длины текстов ключей по номерам.</summary>
     public IReadOnlyList<int> TextLengths => textLengths;
 
     /// <summary>Число уникальных ключей в чанке.</summary>
     public int KeyCount => lookup.Count;
 
+    /// <summary>Байт занято под ключи в буфере чанка.</summary>
+    public int Used => comparer.Offset;
+
     /// <summary>
     /// Строит CSR-массив значений: границы по номерам ключей (префикс-сумма количеств)
     /// и scatter пар в свои диапазоны.
     /// </summary>
-    public long[] BuildCsr()
+    public (long[] Values, int[] CsrOffsets) BuildCsr()
     {
         var k = textLengths.Count;
         var csr = new int[k + 1];
@@ -259,22 +262,7 @@ sealed unsafe class Chunk : IDisposable
         var fill = new int[k];
         foreach (var (number, value) in pairs)
             values[csr[number] + fill[number]++] = value;
-        Values = values;
-        CsrOffsets = csr;
-        return values;
-    }
-
-    /// <summary>Срез нативного буфера sort key.</summary>
-    public unsafe Span<byte> GetSortKeySlice(int offset, int length) => new(sortKeyBuffer + offset, length);
-
-    /// <summary>Компарер sort key, привязанный к текущему нативному буферу sort key.</summary>
-    public unsafe NativeSegmentComparer CreateSortKeyComparer() => new(sortKeyBuffer);
-
-    /// <summary>Выделяет нативный буфер sort key точного размера.</summary>
-    public unsafe void AllocateSortKeys(int totalLength)
-    {
-        sortKeyBuffer = (byte*)NativeMemory.AlignedAlloc((nuint)Math.Max(16, totalLength), 64);
-        sortKeyLength = totalLength;
+        return (values, csr);
     }
 
     /// <summary>
@@ -296,7 +284,15 @@ sealed unsafe class Chunk : IDisposable
         pairs.Add((info.Number, value));
     }
 
-    /// <summary>Возвращает словарь в пул до завершения жизни чанка (после finalize словарь не нужен).</summary>
+    /// <summary>Передаёт владение нативным буфером вызывающему (следующей стадии чанка).</summary>
+    public byte* DetachBuffer()
+    {
+        var detached = buffer;
+        buffer = null;
+        return detached;
+    }
+
+    /// <summary>Возвращает словарь в пул (после finalize словарь не нужен).</summary>
     public void ReleaseLookup()
     {
         if (lookupReleased)
@@ -308,16 +304,102 @@ sealed unsafe class Chunk : IDisposable
     public void Dispose()
     {
         ReleaseLookup();
-        ReleaseSortKeys();
-        NativeMemory.AlignedFree(buffer);
+        if (buffer is not null)
+        {
+            bufferPool.Return(buffer);
+            buffer = null;
+        }
+    }
+}
+
+/// <summary>
+/// Стадия отсортированного чанка: нативный буфер текстов (принят от Chunk), CSR-массив значений,
+/// границы значений и текстов, порядок записи. SerializedSize/Serialize готовят данные к сжатию;
+/// Dispose возвращает текстовый буфер в пул.
+/// </summary>
+sealed unsafe class SortedChunk : IDisposable
+{
+    private byte* buffer;
+    private readonly ChunkBufferPool bufferPool;
+    private readonly long[] values;
+    private readonly int[] csrOffsets;
+    private readonly int[] textOffsets;
+    private readonly int[] order;
+
+    public SortedChunk(
+        byte* buffer,
+        ChunkBufferPool bufferPool,
+        long[] values,
+        int[] csrOffsets,
+        int[] textOffsets,
+        int[] order)
+    {
+        this.buffer = buffer;
+        this.bufferPool = bufferPool;
+        this.values = values;
+        this.csrOffsets = csrOffsets;
+        this.textOffsets = textOffsets;
+        this.order = order;
     }
 
-    /// <summary>Освобождает нативный буфер sort key после записи чанка.</summary>
-    public void ReleaseSortKeys()
+    /// <summary>Срез нативного буфера текстов.</summary>
+    public Span<byte> GetTextSlice(int offset, int length) => new(buffer + offset, length);
+
+    /// <summary>Точный несжатый размер сериализованного чанка (все числа — LEB128 varint).</summary>
+    public long SerializedSize()
     {
-        if (sortKeyBuffer is null)
-            return;
-        NativeMemory.AlignedFree(sortKeyBuffer);
-        sortKeyBuffer = null;
+        long total = 0;
+        foreach (var i in order)
+        {
+            var textLen = textOffsets[i + 1] - textOffsets[i];
+            var count = csrOffsets[i + 1] - csrOffsets[i];
+            total += VarintSize((ulong)textLen) + textLen + VarintSize((ulong)count);
+            long previous = 0;
+            for (var j = csrOffsets[i]; j < csrOffsets[i + 1]; j++)
+            {
+                total += VarintSize(ulong.CreateChecked(values[j] - previous));
+                previous = values[j];
+            }
+        }
+        return total;
     }
+
+    /// <summary>
+    /// Сериализует чанк: varint(длина текста), текст, varint(количество чисел), varint(разности
+    /// чисел) — для каждого ключа в порядке Order. Sort key в файл не пишутся — merge
+    /// пересчитывает их пакетами.
+    /// </summary>
+    public void Serialize(Span<byte> dst)
+    {
+        var pos = 0;
+        foreach (var i in order)
+        {
+            var textLen = textOffsets[i + 1] - textOffsets[i];
+            pos = Extensions.WriteVarint(dst, pos, (ulong)textLen);
+            GetTextSlice(textOffsets[i], textLen).CopyTo(dst.Slice(pos));
+            pos += textLen;
+            var start = csrOffsets[i];
+            var count = csrOffsets[i + 1] - start;
+            pos = Extensions.WriteVarint(dst, pos, (ulong)count);
+            long previous = 0;
+            for (var j = start; j < start + count; j++)
+            {
+                pos = Extensions.WriteVarint(dst, pos, ulong.CreateChecked(values[j] - previous));
+                previous = values[j];
+            }
+        }
+        if (pos != dst.Length)
+            throw new InvalidOperationException($"Chunk serialized size mismatch: {pos} != {dst.Length}");
+    }
+
+    public void Dispose()
+    {
+        if (buffer is not null)
+        {
+            bufferPool.Return(buffer);
+            buffer = null;
+        }
+    }
+
+    private static int VarintSize(ulong value) => 1 + (int)(BitOperations.Log2(value | 1) / 7);
 }
