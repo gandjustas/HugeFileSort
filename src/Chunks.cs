@@ -1,11 +1,12 @@
 using System.Buffers;
 using System.Globalization;
-using System.IO.Compression;
 using System.Numerics;
+using System.Numerics.Tensors;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Text;
 using Microsoft.Extensions.ObjectPool;
+using NV = (int Number, long Value);
 
 /// <summary>Ключ чанка: смещение и длина байт текста в буфере чанка.</summary>
 readonly record struct BufferString(int Offset, int Length);
@@ -85,14 +86,21 @@ sealed class BytesComparer : IEqualityComparer<BufferString>,
     private ReadOnlySpan<byte> Slice(BufferString key) => buffer.AsSpan(key.Offset, key.Length);
 }
 
-/// <summary>Сравнивает BufferString-сегменты (offset/length) в привязанном буфере побайтово.</summary>
-sealed class NativeSegmentComparer(byte[] buffer) : IComparer<BufferString>
+/// <summary>
+/// Порядок ключей для culture-режима: сравнивает номера ключей по срезам их sort key
+/// (лежат в sortKeys подряд, границы — offsets/lengths).
+/// </summary>
+sealed class SortKeyComparer(byte[] sortKeys, byte[] offsets, byte[] lengths) : IComparer<int>
 {
-    public int Compare(BufferString x, BufferString y)
+    public int Compare(int x, int y)
     {
-        if (x.Offset == y.Offset && x.Length == y.Length)
+        if (x == y)
             return 0;
-        return buffer.AsSpan(x.Offset, x.Length).SequenceCompareTo(buffer.AsSpan(y.Offset, y.Length));
+
+        var o = MemoryMarshal.Cast<byte, int>(offsets);
+        var l = MemoryMarshal.Cast<byte, int>(lengths);
+        return sortKeys.AsSpan(o[x], l[x])
+            .SequenceCompareTo(sortKeys.AsSpan(o[y], l[y]));
     }
 }
 
@@ -128,7 +136,10 @@ sealed class ChunkPools
         // Собственный Scratch: maxArrayLength = степень двойки >= bufferSize, чтобы Rent(BufferSize)
         // попадал в верхний bucket. maxArraysPerBucket с запасом покрывает сегменты Pipe
         // (pause 16МБ / 1МБ сегмент = ~16 шт только на чтение входного файла) + sort key + S/C.
-        Scratch = ArrayPool<byte>.Create(checked((int)BitOperations.RoundUpToPowerOf2((uint)bufferSize)), Math.Max(32, maxConcurrent * 8));
+        // Запас x2: culture-режим держит в Scratch конкатенированные чары всех ключей (~2x текстовых байт).
+        Scratch = ArrayPool<byte>.Create(
+            (int)Math.Min(int.MaxValue, 2L * BitOperations.RoundUpToPowerOf2((uint)bufferSize)),
+            Math.Max(32, maxConcurrent * 8));
         Memory = new ScratchMemoryPool(Scratch);
         Lookups = new DefaultObjectPool<Dictionary<BufferString, KeyInfo>>(new LookupPoolPolicy());
     }
@@ -153,14 +164,12 @@ sealed class Chunk : IDisposable
 {
     // Один Lookups.Get() на все три поля: comparer и alternate lookup обязаны
     // принадлежать тому же словарю, что и lookup.
-    private byte[] buffer = [];
-    private readonly int bufferLength;
+    private byte[] buffer;
     private readonly ChunkPools pools;
     private readonly Dictionary<BufferString, KeyInfo> lookup;
     private readonly BytesComparer comparer;
     private readonly Dictionary<BufferString, KeyInfo>.AlternateLookup<ReadOnlySpan<byte>> alt;
-    private readonly List<int> textLengths = [];
-    private int pairsCount;
+    private int valueCount;
     private bool lookupReleased;
 
     public Chunk(ChunkPools pools)
@@ -169,48 +178,12 @@ sealed class Chunk : IDisposable
         lookup = pools.Lookups.Get();
         comparer = (BytesComparer)lookup.Comparer;
         buffer = pools.Scratch.Rent(pools.BufferSize);
-        bufferLength = pools.BufferSize;
-        comparer.Bind(buffer, bufferLength);
+        comparer.Bind(buffer, pools.BufferSize);
         alt = lookup.GetAlternateLookup<ReadOnlySpan<byte>>();
     }
 
-    /// <summary>Буфер текстов ключей (лежат подряд в порядке номеров, от начала буфера).</summary>
-    public Span<byte> BufferSpan => buffer.AsSpan(0, comparer.Offset);
-
     public Dictionary<BufferString, KeyInfo> Lookup => lookup;
 
-    /// <summary>Компарер ключей, привязанный к буферу чанка (используется и для ordinal-сортировки).</summary>
-    public BytesComparer Comparer => comparer;
-
-    /// <summary>Длины текстов ключей по номерам.</summary>
-    public IReadOnlyList<int> TextLengths => textLengths;
-
-    /// <summary>Число уникальных ключей в чанке.</summary>
-    public int KeyCount => lookup.Count;
-
-    /// <summary>
-    /// Строит CSR-массив значений: границы по номерам ключей (счётчики — из KeyInfo.Count)
-    /// и scatter пар, читая хвост буфера в обратном порядке (порядок в диапазоне ключа
-    /// не важен — CSR-диапазон сортируется).
-    /// </summary>
-    public (long[] Values, int[] CsrOffsets) BuildCsr()
-    {
-        var k = textLengths.Count;
-        var csr = new int[k + 1];
-        foreach (var info in lookup.Values)
-            csr[info.Number + 1] = info.Count;
-        for (var i = 1; i <= k; i++)
-            csr[i] += csr[i - 1];
-        var values = GC.AllocateUninitializedArray<long>(pairsCount);
-        var fill = new int[k];
-        var slots = MemoryMarshal.Cast<byte, (uint Number, long Value)>(buffer);
-        for (var i = 1; i <= pairsCount; i++)
-        {
-            var (number, value) = slots[^i];
-            values[csr[number] + fill[number]++] = value;
-        }
-        return (values, csr);
-    }
 
     /// <summary>
     /// Добавляет строку: текст (пишется с начала буфера) и значение (пара (номер, значение) —
@@ -219,27 +192,28 @@ sealed class Chunk : IDisposable
     public void Add(ReadOnlySpan<byte> text, long value)
     {
         comparer.ReservePair();
+        var keyCount = lookup.Count;
         ref var info = ref CollectionsMarshal.GetValueRefOrAddDefault(alt, text, out var exist);
         if (!exist)
         {
-            info = new KeyInfo(textLengths.Count, 1);
-            textLengths.Add(text.Length);
+            // Номер ключа — 0-based (до вставки он равен числу уже находящихся в словаре ключей).
+            info = new KeyInfo(keyCount, 1);
         }
         else
         {
             info = info with { Count = info.Count + 1 };
         }
 
-        pairsCount++;
-        var slots = MemoryMarshal.Cast<byte, (uint Number, long Value)>(buffer.AsSpan());
-        slots[^pairsCount] = ((uint)info.Number, value);
+        valueCount++;
+        var slots = MemoryMarshal.Cast<byte, NV>(buffer.AsSpan());
+        slots[^valueCount] = (info.Number, value);
     }
 
     /// <summary>
-    /// Переход накопление → сортировка: CSR значений из пар, параллельные пассы sort key
-    /// (буфер из Scratch, возвращается сюда же), порядок записи. Словарь возвращается в пул,
-    /// текстовый буфер передаётся в SortedChunk. Ordinal-режим: sort key не вычисляются,
-    /// порядок — по байтам текста.
+    /// Переход накопление → сортировка: CSR значений из пар, декодирование ключей и sort key
+    /// (culture), порядок записи. Все вспомогательные буферы берутся из Scratch — аллокаций нет.
+    /// Словарь возвращается в пул, текстовый буфер передаётся в SortedChunk.
+    /// Ordinal-режим: чары не декодируются и sort key не вычисляются, порядок — по байтам текста.
     /// </summary>
     public SortedChunk Sort(
         Encoding encoding,
@@ -249,78 +223,151 @@ sealed class Chunk : IDisposable
         CancellationToken ct)
     {
         var keyCount = lookup.Count;
-        var maxKeyBytes = textLengths.Count > 0 ? textLengths.Max() : 0;
-        var maxChars = encoding.GetMaxCharCount(maxKeyBytes);
-        // Смещения текстов: тексты лежат в буфере подряд в порядке номеров.
-        var textOffsets = new int[keyCount + 1];
-        for (var i = 0; i < keyCount; i++)
-            textOffsets[i + 1] = textOffsets[i] + textLengths[i];
+        var parallelOptions = new ParallelOptions { CancellationToken = ct };
 
-        int[] sortKeyOffsets = [];
-        int[] sortKeyLengths = [];
-        byte[]? sortKeyBuffer = null;
-        ParallelOptions parallelOptions = new() { CancellationToken = ct };
+        var valueCountBuffer = pools.Scratch.Rent(keyCount * Unsafe.SizeOf<int>());
+        var keyOffsetBuffer = pools.Scratch.Rent(keyCount * Unsafe.SizeOf<int>());
+        var keyLengthBuffer = pools.Scratch.Rent(keyCount * Unsafe.SizeOf<int>());
+        var valueCounts = MemoryMarshal.Cast<byte, int>(valueCountBuffer.AsSpan())[..keyCount];
+        var keyOffsets = MemoryMarshal.Cast<byte, int>(keyOffsetBuffer.AsSpan())[..keyCount];
+        var keyLengths = MemoryMarshal.Cast<byte, int>(keyLengthBuffer.AsSpan())[..keyCount];
 
+        // Чары и их границы по номерам ключей — только для culture-режима.
+        Span<char> chars = [];
+        Span<int> charOffsets = [], charLengths = [];
+        byte[]? charBuffer = null, charOffsetBuffer = null, charLengthBuffer = null;
         if (!ordinal)
         {
-            // Пасс A (параллельно): точная длина sort key каждого ключа.
-            var sortKeyLengthsByNumber = new int[keyCount];
-            Parallel.For(0, keyCount, parallelOptions,
-                () => new char[maxChars],
-                (i, _, buf) =>
-                {
-                    var w = encoding.GetChars(BufferSpan.Slice(textOffsets[i], textLengths[i]), buf);
-                    sortKeyLengthsByNumber[i] = compareInfo.GetSortKeyLength(buf.AsSpan(0, w), compareOptions);
-                    return buf;
-                },
-                _ => { });
-
-            var totalSortKey = 0;
-            for (var i = 0; i < keyCount; i++)
-                totalSortKey += sortKeyLengthsByNumber[i];
-            sortKeyBuffer = pools.Scratch.Rent(Math.Max(16, totalSortKey));
-            sortKeyOffsets = new int[keyCount + 1];
-            for (var i = 0; i < keyCount; i++)
-                sortKeyOffsets[i + 1] = sortKeyOffsets[i] + sortKeyLengthsByNumber[i];
-            sortKeyLengths = sortKeyLengthsByNumber;
+            // Верхняя граница чаров — сумма по ключам: у ряда кодировок GetMaxCharCount
+            // даёт надбавку за вызов, и максимум по всему текстовому буферу её не покрывает.
+            var maxChars = 0;
+            foreach (var (key, _) in lookup)
+                maxChars += encoding.GetMaxCharCount(key.Length);
+            charBuffer = pools.Scratch.Rent(checked(maxChars * Unsafe.SizeOf<char>()));
+            charOffsetBuffer = pools.Scratch.Rent(keyCount * Unsafe.SizeOf<int>());
+            charLengthBuffer = pools.Scratch.Rent(keyCount * Unsafe.SizeOf<int>());
+            chars = MemoryMarshal.Cast<byte, char>(charBuffer.AsSpan())[..maxChars];
+            charOffsets = MemoryMarshal.Cast<byte, int>(charOffsetBuffer.AsSpan())[..keyCount];
+            charLengths = MemoryMarshal.Cast<byte, int>(charLengthBuffer.AsSpan())[..keyCount];
         }
 
-        (var values, var csr) = BuildCsr();
-
-        // Параллельно: sort key каждого ключа (culture) и сортировка его CSR-диапазона.
-        Parallel.For(0, keyCount, parallelOptions,
-            () => new char[maxChars],
-            (i, _, buf) =>
+        var currentOffset = 0;
+        var buffer = DetachBuffer();
+        foreach (var (key, info) in lookup)
+        {
+            valueCounts[info.Number] = info.Count;
+            keyOffsets[info.Number] = key.Offset;
+            keyLengths[info.Number] = key.Length;
+            if (!ordinal)
             {
-                if (!ordinal)
-                {
-                    var w = encoding.GetChars(BufferSpan[textOffsets[i]..textOffsets[i + 1]], buf);
-                    compareInfo.GetSortKey(buf.AsSpan(0, w), sortKeyBuffer.AsSpan(sortKeyOffsets[i], sortKeyLengths[i]), compareOptions);
-                }
-                Array.Sort(values, csr[i], csr[i + 1] - csr[i]);
-                return buf;
-            },
-            _ => { });
-
-        // Порядок записи: номера ключей по возрастанию sort key (ordinal — по байтам текста).
-        var order = Enumerable.Range(0, keyCount).ToArray();
-        var indices = new BufferString[keyCount];
-        for (var i = 0; i < keyCount; i++)
-            indices[i] = ordinal
-                ? new BufferString(textOffsets[i], textOffsets[i + 1] - textOffsets[i])
-                : new BufferString(sortKeyOffsets[i], sortKeyLengths[i]);
-        if (ordinal)
-            Array.Sort(indices, order, comparer);
-        else
-            Array.Sort(indices, order, new NativeSegmentComparer(sortKeyBuffer!));
-
-        // Sort key нужен только для сортировки порядка — возвращается в Scratch здесь же.
-        if (sortKeyBuffer is not null)
-            pools.Scratch.Return(sortKeyBuffer);
-
+                charOffsets[info.Number] = currentOffset;
+                var len = encoding.GetChars(buffer.AsSpan(key.Offset, key.Length), chars[currentOffset..]);
+                charLengths[info.Number] = len;
+                currentOffset += len;
+            }
+        }
         // Словарь возвращается в пул, текстовый буфер передаётся следующей стадии.
         ReleaseLookup();
-        return new SortedChunk(pools, DetachBuffer(), values, csr, textOffsets, order);
+
+        // CSR значений: стартовые смещения из префиксных сумм счётчиков, scatter пар из хвоста
+        // буфера (движением стартов, без отдельного массива курсоров), затем вычитание счётчиков
+        // возвращает смещения к стартам диапазонов.
+        var valueOffsetBuffer = pools.Scratch.Rent(keyCount * Unsafe.SizeOf<int>());
+        var valueOffsets = MemoryMarshal.Cast<byte, int>(valueOffsetBuffer.AsSpan())[..keyCount];
+        valueOffsets[0] = 0;
+        for (var i = 1; i < keyCount; i++)
+            valueOffsets[i] = valueOffsets[i - 1] + valueCounts[i - 1];
+
+        var valuesBuffer = pools.Scratch.Rent(checked(valueCount * Unsafe.SizeOf<long>()));
+        var values = MemoryMarshal.Cast<byte, long>(valuesBuffer.AsSpan())[..valueCount];
+        var source = MemoryMarshal.Cast<byte, NV>(buffer);
+        for (int i = 1; i <= valueCount; i++)
+        {
+            var (number, value) = source[^i];
+            values[valueOffsets[number]++] = value;
+        }
+        TensorPrimitives.Subtract(valueOffsets, valueCounts, valueOffsets);
+
+        byte[]? sortKeyBuffer = null, sortKeyOffsetBuffer = null, sortKeyLengthBuffer = null;
+        Span<int> sortKeyOffsets = [], sortKeyLengths = [];
+        if (!ordinal)
+        {
+            // Пасс A: длина sort key каждого ключа — параллельно, вход — уже декодированные чары.
+            // Спаны в теле нарезаются заново: ref struct'ы нельзя захватить в делегат.
+            sortKeyLengthBuffer = pools.Scratch.Rent(keyCount * Unsafe.SizeOf<int>());
+            sortKeyLengths = MemoryMarshal.Cast<byte, int>(sortKeyLengthBuffer.AsSpan())[..keyCount];
+            Parallel.For(0, keyCount, parallelOptions, i =>
+            {
+                var lens = MemoryMarshal.Cast<byte, int>(sortKeyLengthBuffer.AsSpan());
+                var ch = MemoryMarshal.Cast<byte, char>(charBuffer.AsSpan());
+                var co = MemoryMarshal.Cast<byte, int>(charOffsetBuffer.AsSpan());
+                var cl = MemoryMarshal.Cast<byte, int>(charLengthBuffer.AsSpan());
+                lens[i] = compareInfo.GetSortKeyLength(ch.Slice(co[i], cl[i]), compareOptions);
+            });
+
+            // Точный размер под все sort key — сумма длин по ключам (длина конкатенации не годится).
+            var totalSortKey = 0;
+            for (int i = 0; i < keyCount; i++)
+                totalSortKey += sortKeyLengths[i];
+            sortKeyBuffer = pools.Scratch.Rent(Math.Max(16, totalSortKey));
+            sortKeyOffsetBuffer = pools.Scratch.Rent(keyCount * Unsafe.SizeOf<int>());
+            sortKeyOffsets = MemoryMarshal.Cast<byte, int>(sortKeyOffsetBuffer.AsSpan())[..keyCount];
+            sortKeyOffsets[0] = 0;
+            for (int i = 1; i < keyCount; i++)
+                sortKeyOffsets[i] = sortKeyOffsets[i - 1] + sortKeyLengths[i - 1];
+        }
+
+        // Параллельно: sort key каждого ключа пишется в свой непересекающийся диапазон буфера
+        // (culture), значения внутри диапазона ключа сортируются по возрастанию (оба режима).
+        Parallel.For(0, keyCount, parallelOptions, i =>
+        {
+            if (!ordinal)
+            {
+                var ch = MemoryMarshal.Cast<byte, char>(charBuffer.AsSpan());
+                var co = MemoryMarshal.Cast<byte, int>(charOffsetBuffer.AsSpan());
+                var cl = MemoryMarshal.Cast<byte, int>(charLengthBuffer.AsSpan());
+                var st = MemoryMarshal.Cast<byte, int>(sortKeyOffsetBuffer.AsSpan());
+                var ln = MemoryMarshal.Cast<byte, int>(sortKeyLengthBuffer.AsSpan());
+                compareInfo.GetSortKey(ch.Slice(co[i], cl[i]), sortKeyBuffer.AsSpan(st[i], ln[i]), compareOptions);
+            }
+            var values = MemoryMarshal.Cast<byte, long>(valuesBuffer.AsSpan());
+            var starts = MemoryMarshal.Cast<byte, int>(valueOffsetBuffer.AsSpan());
+            var counts = MemoryMarshal.Cast<byte, int>(valueCountBuffer.AsSpan());
+            values.Slice(starts[i], counts[i]).Sort();
+        });
+
+        // Чары нужны только до вычисления sort key — возвращаются в Scratch здесь же.
+        if (!ordinal)
+        {
+            pools.Scratch.Return(charBuffer!);
+            pools.Scratch.Return(charOffsetBuffer!);
+            pools.Scratch.Return(charLengthBuffer!);
+        }
+
+        // Порядок записи: номера ключей по возрастанию sort key (ordinal — по байтам текста);
+        // компарер сравнивает срезы по номеру ключа. Сортируем срез [0..keyCount):
+        // арендованный буфер длиннее и забит мусором из пула.
+        var orderBuffer = pools.Scratch.Rent(keyCount * Unsafe.SizeOf<int>());
+        var order = MemoryMarshal.Cast<byte, int>(orderBuffer.AsSpan())[..keyCount];
+        for (var i = 0; i < keyCount; i++)
+            order[i] = i;
+        if (ordinal)
+            order.Sort(new SortKeyComparer(buffer, keyOffsetBuffer, keyLengthBuffer));
+        else
+            order.Sort(new SortKeyComparer(sortKeyBuffer!, sortKeyOffsetBuffer!, sortKeyLengthBuffer!));
+
+        // Sort key-массивы нужны только для сортировки порядка — возвращаются в пулы здесь же.
+        if (sortKeyBuffer is not null)
+        {
+            pools.Scratch.Return(sortKeyBuffer);
+            pools.Scratch.Return(sortKeyOffsetBuffer!);
+            pools.Scratch.Return(sortKeyLengthBuffer!);
+        }
+
+        return new SortedChunk(pools,
+            buffer, keyCount, keyOffsetBuffer, keyLengthBuffer,
+            valuesBuffer, valueOffsetBuffer, valueCountBuffer,
+            orderBuffer);
     }
 
     /// <summary>Передаёт владение текстовым буфером вызывающему (следующей стадии чанка).</summary>
@@ -347,134 +394,4 @@ sealed class Chunk : IDisposable
             pools.Scratch.Return(buffer);
         buffer = [];
     }
-}
-
-/// <summary>
-/// Стадия отсортированного чанка: текстовый буфер (принят от Chunk), CSR-массив значений,
-/// границы значений и текстов, порядок записи. SerializedSize/Serialize готовят данные к сжатию,
-/// Compress выполняет переход в CompressedChunk; Dispose возвращает текстовый буфер в Scratch.
-/// </summary>
-sealed class SortedChunk : IDisposable
-{
-    private byte[] buffer = [];
-    private readonly ChunkPools pools;
-    private readonly long[] values;
-    private readonly int[] csrOffsets;
-    private readonly int[] textOffsets;
-    private readonly int[] order;
-
-    public SortedChunk(
-        ChunkPools pools,
-        byte[] buffer,
-        long[] values,
-        int[] csrOffsets,
-        int[] textOffsets,
-        int[] order)
-    {
-        this.pools = pools;
-        this.buffer = buffer;
-        this.values = values;
-        this.csrOffsets = csrOffsets;
-        this.textOffsets = textOffsets;
-        this.order = order;
-    }
-
-    /// <summary>Срез буфера текстов.</summary>
-    public Span<byte> GetTextSlice(int offset, int length) => buffer.AsSpan(offset, length);
-
-    /// <summary>Точный несжатый размер сериализованного чанка (все числа — LEB128 varint).</summary>
-    public long SerializedSize()
-    {
-        long total = 0;
-        foreach (var i in order)
-        {
-            var textLen = textOffsets[i + 1] - textOffsets[i];
-            var count = csrOffsets[i + 1] - csrOffsets[i];
-            total += VarintSize((ulong)textLen) + textLen + VarintSize((ulong)count);
-            long previous = 0;
-            for (var j = csrOffsets[i]; j < csrOffsets[i + 1]; j++)
-            {
-                total += VarintSize(ulong.CreateChecked(values[j] - previous));
-                previous = values[j];
-            }
-        }
-        return total;
-    }
-
-    /// <summary>
-    /// Сериализует чанк: varint(длина текста), текст, varint(количество чисел), varint(разности
-    /// чисел) — для каждого ключа в порядке Order. Sort key в файл не пишутся — merge
-    /// пересчитывает их пакетами.
-    /// </summary>
-    public void Serialize(Span<byte> dst)
-    {
-        var pos = 0;
-        foreach (var i in order)
-        {
-            var textLen = textOffsets[i + 1] - textOffsets[i];
-            pos = Extensions.WriteVarint(dst, pos, (ulong)textLen);
-            GetTextSlice(textOffsets[i], textLen).CopyTo(dst.Slice(pos));
-            pos += textLen;
-            var start = csrOffsets[i];
-            var count = csrOffsets[i + 1] - start;
-            pos = Extensions.WriteVarint(dst, pos, (ulong)count);
-            long previous = 0;
-            for (var j = start; j < start + count; j++)
-            {
-                pos = Extensions.WriteVarint(dst, pos, ulong.CreateChecked(values[j] - previous));
-                previous = values[j];
-            }
-        }
-        if (pos != dst.Length)
-            throw new InvalidOperationException($"Chunk serialized size mismatch: {pos} != {dst.Length}");
-    }
-
-    /// <summary>
-    /// Переход сортировка → сжатие: сериализация в буфер S точного размера (текстовый буфер
-    /// возвращается в Scratch сразу после неё), one-shot zstd S → C.
-    /// </summary>
-    public CompressedChunk Compress(FileInfo file, int quality, int maxWindowLog2)
-    {
-        var size = SerializedSize();
-        var s = pools.Scratch.Rent(checked((int)size));
-        Serialize(s.AsSpan(0, (int)size));
-        Dispose(); // текстовый буфер возвращается в Scratch до сжатия
-
-        var cLength = checked((int)ZstandardEncoder.GetMaxCompressedLength(size));
-        var c = pools.Scratch.Rent(cLength);
-        using ZstandardEncoder encoder = new(new ZstandardCompressionOptions
-        {
-            Quality = quality,
-            WindowLog = Math.Min(maxWindowLog2, Math.Clamp(BitOperations.Log2((uint)size) + 1, 20, 31)),
-            EnableLongDistanceMatching = true,
-        });
-        // Один вызов на весь чанк (isFinalBlock дописывает footer кадра).
-        var status = encoder.Compress(s.AsSpan(0, (int)size), c.AsSpan(0, cLength),
-            out var consumed, out var written, isFinalBlock: true);
-        if (status != OperationStatus.Done || consumed != size)
-            throw new InvalidOperationException($"zstd compression incomplete: {status}, {consumed} of {size}");
-        pools.Scratch.Return(s);
-        return new CompressedChunk(pools, file, c, written);
-    }
-
-    public void Dispose()
-    {
-        if (buffer.Length > 0)
-            pools.Scratch.Return(buffer);
-        buffer = [];
-    }
-
-    private static int VarintSize(ulong value) => 1 + (int)(BitOperations.Log2(value | 1) / 7);
-}
-
-/// <summary>Сжатый чанк в памяти: файл назначения и сжатые данные (буфер возвращает писатель через Dispose).</summary>
-sealed class CompressedChunk(ChunkPools pools, FileInfo file, byte[] buffer, int length) : IDisposable
-{
-    public FileInfo File { get; } = file;
-
-    public byte[] Buffer { get; } = buffer;
-
-    public int Length { get; } = length;
-
-    public void Dispose() => pools.Scratch.Return(Buffer);
 }

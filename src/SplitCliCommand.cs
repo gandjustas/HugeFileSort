@@ -47,7 +47,6 @@ internal partial class SplitCliCommand
     // ——— Состояние конвейера; инициализируется Initialize перед прогоном ———
     private Encoding encoding = null!;
     private CompareInfo compareInfo = null!;
-    private CompareOptions compareOptions;
     private bool isUtf8;
     private bool isOrdinal;
     private byte[] newLine = null!;
@@ -63,10 +62,10 @@ internal partial class SplitCliCommand
 
     private async Task<int> ExecuteAsync(Encoding encoding, CompareOptions compareOptions, CancellationToken ct)
     {
-        Channel<FileInfo> files = Channel.CreateUnbounded<FileInfo>();
+        Channel<string> files = Channel.CreateUnbounded<string>();
         var t = SplitAsync(encoding, compareOptions, files.Writer, ct);
         await foreach (var file in files.Reader.ReadAllAsync(ct))
-            Console.WriteLine(file.FullName);
+            Console.WriteLine(file);
         await t;
         return 0;
     }
@@ -75,11 +74,10 @@ internal partial class SplitCliCommand
     internal async Task SplitAsync(
         Encoding encoding,
         CompareOptions compareOptions,
-        ChannelWriter<FileInfo> files,
+        ChannelWriter<string> files,
         CancellationToken ct)
     {
         this.encoding = encoding;
-        this.compareOptions = compareOptions;
         compareInfo = CultureInfo.CurrentCulture.CompareInfo;
         isUtf8 = encoding.WebName == "utf-8";
         isOrdinal = compareOptions == CompareOptions.Ordinal;
@@ -99,20 +97,22 @@ internal partial class SplitCliCommand
                 CancellationToken = ct,
             });
         TransformBlock<SortedChunk, CompressedChunk> compressor = new(
-            sorted => sorted.Compress(NextChunkFile(), ZstdLevel, windowLog2),
+            sorted => sorted.Compress(ZstdLevel, windowLog2),
             new ()
             {
-                MaxDegreeOfParallelism = 2,
-                BoundedCapacity = 2,
+                MaxDegreeOfParallelism = Parallelism,
+                BoundedCapacity = Parallelism + 2,
                 EnsureOrdered = false,
                 CancellationToken = ct,
             });
         ActionBlock<CompressedChunk> saver = new(
             async chunk =>
             {
-                WriteChunk(chunk);
+                // Имя файла вычисляется только здесь: писатель один, порядок чанков не важен.
+                var path = Path.ChangeExtension(Source.FullName, $".chunk-{savedChunkCount++:D3}{Path.GetExtension(Source.FullName)}");
+                WriteChunk(path, chunk);
                 chunk.Dispose();
-                await files.WriteAsync(chunk.File, ct);
+                await files.WriteAsync(path, ct);
             },
             new ()
             {
@@ -264,18 +264,11 @@ internal partial class SplitCliCommand
         }
     }
 
-    /// <summary>Имя файла очередного чанка.</summary>
-    private FileInfo NextChunkFile()
-    {
-        var index = Interlocked.Increment(ref savedChunkCount) - 1;
-        return new FileInfo(Path.ChangeExtension(Source.FullName, $".chunk-{index:D3}{Path.GetExtension(Source.FullName)}"));
-    }
-
     /// <summary>Пишет сжатый чанк на диск одним Write (преаллокация точного размера — без расширения по кусочкам).</summary>
-    private static void WriteChunk(CompressedChunk chunk)
+    private static void WriteChunk(string path, CompressedChunk chunk)
     {
         using FileStream fileStream = new(
-            chunk.File.FullName,
+            path,
             FileMode.Create, FileAccess.Write, FileShare.None,
             bufferSize: 0,
             FileOptions.SequentialScan

@@ -11,6 +11,7 @@
 
   <ItemGroup>
     <!-- zstd из BCL .NET 11; до GA net11 — backport с теми же типами System.IO.Compression.Zstandard*. -->
+    <PackageReference Include="System.Numerics.Tensors" />
     <PackageReference Include="SystemIOCompression.Zstandard.Backporting" />
     <PackageReference Include="Microsoft.Extensions.ObjectPool" />
     <PackageReference Include="DotMake.CommandLine" />

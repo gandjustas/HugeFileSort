@@ -28,7 +28,7 @@ static class MergeExtensions
             new BoundedChannelOptions(1) { SingleWriter = true, SingleReader = true });
         return Task.WhenAll(
             ReadChunks(stream, buffers.Writer, batchBytes, ct),
-            ComputeBatches(buffers.Reader, channel, encoding, compareInfo, compareOptions, cpuSlots, batchBytes, ct));
+            ComputeBatches(buffers.Reader, channel, encoding, compareInfo, compareOptions, cpuSlots, ct));
     }
 
     /// <summary>Читатель: наполняет буферы до конца (или eof) и передаёт вычислителю.</summary>
@@ -82,7 +82,6 @@ static class MergeExtensions
         CompareInfo compareInfo,
         CompareOptions compareOptions,
         SemaphoreSlim cpuSlots,
-        int batchBytes,
         CancellationToken ct)
     {
         byte[]? pending = null; // хвост незавершённой записи прошлой порции
@@ -174,8 +173,8 @@ static class MergeExtensions
         bool atEof,
         out int consumed)
     {
-        List<BatchEntryMeta> metas = new();
-        List<long> values = new();
+        List<BatchEntryMeta> metas = [];
+        List<long> values = [];
         // Срез от начала буфера: TryReadVarint индексирует pos относительно начала среза,
         // а pos здесь — абсолютное смещение в буфере.
         var span = buffer.AsSpan(0, end);
@@ -308,7 +307,7 @@ static class MergeExtensions
         Func<IReadOnlyList<T>, V> merge,
         [EnumeratorCancellation] CancellationToken ct = default)
     {
-        List<IAsyncEnumerator<T>> enumerators = sources.Select(s => s.GetAsyncEnumerator(ct)).ToList();
+        List<IAsyncEnumerator<T>> enumerators = [.. sources.Select(s => s.GetAsyncEnumerator(ct))];
         try
         {
             await foreach (var x in MergeSortedWithPriorityQueue(enumerators, comparer, merge, ct).ConfigureAwait(false))
@@ -344,6 +343,7 @@ static class MergeExtensions
         }
         while (pq.TryDequeue(out var current, out var x))
         {
+            ct.ThrowIfCancellationRequested();
             // Собираем группу равных (по компаратору) элементов: записи — в group,
             // их потоки — в groupSources (индексы совпадают).
             group.Add(current.Current);
@@ -390,7 +390,7 @@ static class MergeExtensions
         this IEnumerable<IEnumerable<T>> sources,
         IComparer<T> comparer)
     {
-        List<IEnumerator<T>> enumerators = sources.Select(s => s.GetEnumerator()).ToList();
+        List<IEnumerator<T>> enumerators = [.. sources.Select(s => s.GetEnumerator())];
         try
         {
             if (enumerators.Count == 1)
@@ -434,7 +434,7 @@ static class MergeExtensions
         }
         while (pq.TryDequeue(out var current, out var x))
         {
-            while (pq.TryPeek(out var e, out var y) && comparer.Compare(x, y) == 0)
+            while (pq.TryPeek(out var _, out var y) && comparer.Compare(x, y) == 0)
             {
                 l.Add(current);
                 current = pq.Dequeue();

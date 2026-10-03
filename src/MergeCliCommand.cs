@@ -37,19 +37,19 @@ internal partial class MergeCliCommand
 
     private async Task<int> ExecuteAsync(Encoding encoding, CompareOptions compareOptions, CancellationToken ct)
     {
-        List<FileInfo> chunks = [];
+        List<string> chunks = [];
         while (Console.ReadLine() is { } line)
         {
             line = line.Trim();
             if (line.Length != 0)
-                chunks.Add(new FileInfo(line));
+                chunks.Add(line);
         }
         await MergeAsync(encoding, compareOptions, chunks, ct);
         return 0;
     }
 
     /// <summary>Мержит чанки в Destination с готовыми настройками; используется и командой sort.</summary>
-    internal async Task MergeAsync(Encoding encoding, CompareOptions compareOptions, IReadOnlyList<FileInfo> chunkFiles, CancellationToken ct)
+    internal async Task MergeAsync(Encoding encoding, CompareOptions compareOptions, IReadOnlyList<string> chunkFiles, CancellationToken ct)
     {
         Stopwatch sw = Stopwatch.StartNew();
         var newLine = encoding.GetBytes(Environment.NewLine);
@@ -108,11 +108,11 @@ internal partial class MergeCliCommand
     }
 
     /// <summary>Продюсер одного чанка: декомпрессия → пакеты записей → канал.</summary>
-    private async Task ProduceChunk(FileInfo file, Channel<Batch> channel, SemaphoreSlim cpuSlots, Encoding encoding, CompareOptions compareOptions, CancellationToken ct)
+    private static async Task ProduceChunk(string path, Channel<Batch> channel, SemaphoreSlim cpuSlots, Encoding encoding, CompareOptions compareOptions, CancellationToken ct)
     {
         try
         {
-            FileStream fileStream = new(file.FullName, FileMode.Open, FileAccess.Read, FileShare.Read,
+            FileStream fileStream = new(path, FileMode.Open, FileAccess.Read, FileShare.Read,
                 bufferSize: 4 << 20, FileOptions.SequentialScan | FileOptions.Asynchronous);
             // Окно сжатия чанков ограничено бюджетом (~2ГБ на все параллельные декодеры) —
             // лимит задаёт декодер.
@@ -161,7 +161,7 @@ internal partial class MergeCliCommand
     /// например «ß» и «ss» в de-DE) в единый поток (значение, текст) по возрастанию значения.
     /// Штатный случай — одна запись в группе: значения отдаются напрямую, без хипа и LINQ-цепочек.
     /// </summary>
-    private IEnumerable<(long Value, ArraySegment<byte> Text)> MergeGroup(IReadOnlyList<ReadChunkEntry> group)
+    private static IEnumerable<(long Value, ArraySegment<byte> Text)> MergeGroup(IReadOnlyList<ReadChunkEntry> group)
     {
         if (group.Count == 1)
             return SingleGroup(group[0]);

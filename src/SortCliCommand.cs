@@ -53,11 +53,11 @@ internal partial class SortCliCommand
             MaxChunkMb = MaxChunkMb,
             ZstdLevel = ZstdLevel,
         };
-        var files = Channel.CreateUnbounded<FileInfo>();
+        var files = Channel.CreateUnbounded<string>();
         await split.SplitAsync(encoding, compareOptions, files.Writer, ct);
         var chunks = await files.Reader.ReadAllAsync(ct).ToArrayAsync(ct);
 
-        foreach (var file in chunks) Console.WriteLine(file.FullName);
+        foreach (var file in chunks) Console.WriteLine(file);
         Console.WriteLine($"Chunks: {chunks.Length}");
         Console.WriteLine(sw.Elapsed);
 
@@ -76,11 +76,11 @@ internal partial class SortCliCommand
         {
             try
             {
-                file.Delete();
+                File.Delete(file);
             }
             catch (Exception ex)
             {
-                Console.Error.WriteLine($"Delete failed: {file.FullName}: {ex.Message}");
+                Console.Error.WriteLine($"Delete failed: {file}: {ex.Message}");
             }
         }
         return 0;
