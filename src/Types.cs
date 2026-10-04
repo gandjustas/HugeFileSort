@@ -1,73 +1,63 @@
-using System.Buffers;
+using System.Runtime.InteropServices;
 
 /// <summary>
-/// Запись промежуточного файла при merge: текст и sort key — сегменты буферов пакета (Batch),
-/// значения — срез общего массива значений пакета. Dispose уменьшает счётчик пакета: последний
-/// возврат возвращает буферы пакета в пулы (MergeSorted делает это после потребления группы).
+/// Окно чтения пайпа одного чанка: фиксирует абсолютную позицию (в байтах потока чанка), до
+/// которой записи обработаны мержем (Dispose последней обработанной ChunkLine). Разбор пайпа
+/// двигает consumed только на неё, поэтому пайп не переиспользует байты записей, которые мерж
+/// ещё держит. Позиции — long, а не SequencePosition: сегменты пайпа рециклируются (объект
+/// сегмента переиспользуется следующей записью), и объекты позиций нельзя хранить через границы
+/// ReadAsync. Обращения только из потока мержа, синхронизация не нужна.
 /// </summary>
-sealed class ReadChunkEntry(
-    Batch batch,
-    ArraySegment<byte> text,
-    ArraySegment<byte> sortKey,
-    long[] values,
+sealed class ChunkWindow
+{
+    public bool HasReleased { get; private set; }
+
+    public long ReleasedEnd { get; private set; }
+
+    /// <summary>Мерж вызывает после записи записи в результат; релизы идут в порядке записей.</summary>
+    public void Release(long end)
+    {
+        ReleasedEnd = end;
+        HasReleased = true;
+    }
+}
+
+/// <summary>
+/// Запись чанка при merge: текст, sort key и значения лежат в одном сегменте буфера пайпа
+/// своего чанка (продюсер пишет запись одним GetSpan — запись целиком в одном сегменте).
+/// Спаны нарезаются прямо из пайпа; Dispose возвращает байты пайпу после записи группы в мерже.
+/// </summary>
+readonly struct ChunkLine(
+    ChunkWindow window,
+    byte[] array,
+    int textStart,
+    int textLength,
+    int keyStart,
+    int keyLength,
     int valuesStart,
-    int valuesCount) : IDisposable
+    int valuesCount,
+    long end) : IDisposable
 {
     /// <summary>Байты текста в кодировке файла.</summary>
-    public ArraySegment<byte> Text { get; } = text;
+    public ReadOnlySpan<byte> Text => array.AsSpan(textStart, textLength);
 
-    /// <summary>Явный sort key текста (ordinal: алиас текста; культура: сегмент буфера пакета).</summary>
-    public ArraySegment<byte> SortKey { get; } = sortKey;
+    /// <summary>Sort key текста; ordinal-режим пишет keyLength = 0 — ключ алиасит текст.</summary>
+    public ReadOnlySpan<byte> SortKey => keyLength == 0 ? Text : array.AsSpan(keyStart, keyLength);
 
-    /// <summary>Общий массив значений пакета (срез — по ValuesStart/ValuesCount).</summary>
-    public long[] ValuesArray { get; } = values;
+    /// <summary>Значения записи, развёрнутые из δ-варинтов продюсером чанка.</summary>
+    public ReadOnlySpan<long> Values => MemoryMarshal.Cast<byte, long>(array.AsSpan(valuesStart, valuesCount * 8));
 
-    public int ValuesStart { get; } = valuesStart;
+    /// <summary>Число значений записи — без нарезки спана (нужен в итераторах через yield).</summary>
+    public int ValuesLength => valuesCount;
 
-    public int ValuesCount { get; } = valuesCount;
-
-    public void Dispose() => batch.Release();
+    /// <summary>Запись записана в результат — пайп может освободить её байты.</summary>
+    public void Dispose() => window.Release(end);
 }
 
-/// <summary>
-/// Пакет записей одного чанка при merge: арендованный буфер текстов (записи ссылаются в него
-/// zero-copy), буфер sort key (в ordinal-режиме не выделяется) и общий массив значений.
-/// Пакет живёт, пока merge не потребит все записи: каждая ReadChunkEntry.Dispose уменьшает
-/// счётчик, последний возвращает массивы в пулы.
-/// </summary>
-sealed class Batch(byte[] buffer, byte[]? sortKeyBuffer, int entryCount)
+/// <summary>Сравнивает записи чанков только по sort key (побайтово).</summary>
+sealed class ChunkLineComparer : IComparer<ChunkLine>
 {
-    private readonly byte[] buffer = buffer;
-    private readonly byte[]? sortKeyBuffer = sortKeyBuffer;
-    private int remaining = entryCount;
+    public static readonly ChunkLineComparer Instance = new();
 
-    /// <summary>Записи пакета; заполняется после создания пакета.</summary>
-    public ReadChunkEntry[] Entries { get; set; } = [];
-
-    /// <summary>Вызывается при потреблении очередной записи; последний возврат — буферы в пулы.</summary>
-    public void Release()
-    {
-        if (Interlocked.Decrement(ref remaining) == 0)
-        {
-            ArrayPool<byte>.Shared.Return(buffer);
-            if (sortKeyBuffer is not null)
-                ArrayPool<byte>.Shared.Return(sortKeyBuffer);
-        }
-    }
-}
-
-/// <summary>Метаданные записи пакета: смещение/длина текста, диапазон значений в общем массиве.</summary>
-readonly record struct BatchEntryMeta(int TextOffset, int TextLength, int ValuesStart, int ValuesCount);
-
-/// <summary>Сравнивает записи промежуточных файлов только по sort key (побайтово).</summary>
-sealed class ChunkEntryComparer : IComparer<ReadChunkEntry>
-{
-    public static readonly ChunkEntryComparer Instance = new();
-
-    public int Compare(ReadChunkEntry? x, ReadChunkEntry? y)
-    {
-        if (x is null) return y is null ? 0 : -1;
-        if (y is null) return 1;
-        return x.SortKey.AsSpan().SequenceCompareTo(y.SortKey.AsSpan());
-    }
+    public int Compare(ChunkLine x, ChunkLine y) => x.SortKey.SequenceCompareTo(y.SortKey);
 }

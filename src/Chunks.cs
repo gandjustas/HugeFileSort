@@ -192,6 +192,11 @@ sealed class Chunk : IDisposable
     public void Add(ReadOnlySpan<byte> text, long value)
     {
         comparer.ReservePair();
+        // Create проверяет место только под новый текст: чанк из одних дубликатов уже собранных
+        // ключей иначе растит хвост пар до текстов и затирает их. Исключение — обычный сигнал
+        // переполнения: SplitToChunks отдаст чанк и повторит строку в новом.
+        if (comparer.Free < 0)
+            throw new OverflowException("Not enough space in the chunk buffer for a value pair");
         var keyCount = lookup.Count;
         ref var info = ref CollectionsMarshal.GetValueRefOrAddDefault(alt, text, out var exist);
         if (!exist)

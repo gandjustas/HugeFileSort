@@ -55,11 +55,7 @@ internal partial class SortCliCommand
         };
         var files = Channel.CreateUnbounded<string>();
         await split.SplitAsync(encoding, compareOptions, files.Writer, ct);
-        var chunks = await files.Reader.ReadAllAsync(ct).ToArrayAsync(ct);
-
-        foreach (var file in chunks) Console.WriteLine(file);
-        Console.WriteLine($"Chunks: {chunks.Length}");
-        Console.WriteLine(sw.Elapsed);
+        Console.WriteLine($"Split: {sw.Elapsed}");
 
         // Параметры merge-команды: destination (или имя по умолчанию), порог сброса,
         // режим сравнения и преаллокация итогового файла по размеру исходника.
@@ -70,7 +66,9 @@ internal partial class SortCliCommand
             CompareOptionsName = CompareOptionsName,
             PreallocatedLength = Source.Length,
         };
-        await merge.MergeAsync(encoding, compareOptions, chunks, ct);
+        // Пути чанков уходят в merge прямо из канала split'а; список возвращает merge.
+        var chunks = await merge.MergeAsync(encoding, compareOptions, files.Reader.ReadAllAsync(ct), ct);
+        Console.WriteLine($"Chunks: {chunks.Count}");
 
         foreach (var file in chunks)
         {

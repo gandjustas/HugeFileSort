@@ -1,311 +1,126 @@
 using System.Buffers;
-using System.Globalization;
+using System.IO.Pipelines;
 using System.Runtime.CompilerServices;
-using System.Text;
-using System.Threading.Channels;
+using System.Runtime.InteropServices;
 
 static class MergeExtensions
 {
-    // Граница stackalloc для декодирующего char-буфера записи (8K char = 16КБ); больше — аллокация.
-    private const int StackallocCharThreshold = 8 * 1024;
-
     /// <summary>
-    /// Продюсер чанка при merge: читатель и вычислитель работают параллельно — читатель наполняет
-    /// буферы из декомпрессионного потока, не дожидаясь CPU, вычислитель считает sort key пакета
-    /// под глобальным CPU-слотом. Буфер с текстами записей переходит во владение пакету.
+    /// Разбирает буфер пайпа чанка в перечисление записей. Формат записи в пайпе:
+    /// [varint textLen][text][varint keyLen][key][varint count][count×long].
+    /// consumed двигается только до последней обработанной записи: ChunkLine.Dispose двигает
+    /// окно, итератор делает AdvanceTo не дальше него, поэтому мерж может держать записи групп
+    /// (в том числе по две у одного источника при lookahead), а пайп не переиспользует их байты.
+    /// Позиции ведутся в абсолютных байтах потока чанка: каждая AdvanceTo строится через
+    /// GetPosition текущего буфера, объекты SequencePosition через границы ReadAsync не хранятся.
     /// </summary>
-    public static Task ProduceBatches(
-        this Stream stream,
-        ChannelWriter<Batch> channel,
-        Encoding encoding,
-        CompareInfo compareInfo,
-        CompareOptions compareOptions,
-        SemaphoreSlim cpuSlots,
-        int batchBytes,
-        CancellationToken ct)
+    public static async IAsyncEnumerable<ChunkLine> ReadLines(
+        this PipeReader reader,
+        [EnumeratorCancellation] CancellationToken ct = default)
     {
-        Channel<(byte[] Buffer, int Filled, bool Eof)> buffers = Channel.CreateBounded<(byte[] Buffer, int Filled, bool Eof)>(
-            new BoundedChannelOptions(1) { SingleWriter = true, SingleReader = true });
-        return Task.WhenAll(
-            ReadChunks(stream, buffers.Writer, batchBytes, ct),
-            ComputeBatches(buffers.Reader, channel, encoding, compareInfo, compareOptions, cpuSlots, ct));
-    }
-
-    /// <summary>Читатель: наполняет буферы до конца (или eof) и передаёт вычислителю.</summary>
-    private static async Task ReadChunks(
-        Stream stream,
-        ChannelWriter<(byte[] Buffer, int Filled, bool Eof)> buffers,
-        int batchBytes,
-        CancellationToken ct)
-    {
+        ChunkWindow window = new();
+        var start = 0L;     // абсолютная позиция начала буфера (= байт уже отдано consumed)
+        var parseAbs = 0L;  // абсолютная позиция следующей неразобранной записи
         try
         {
             while (true)
             {
-                var buffer = ArrayPool<byte>.Shared.Rent(batchBytes);
-                int filled = 0;
-                var eof = false;
-                while (filled < buffer.Length)
-                {
-                    var n = await stream.ReadAsync(buffer.AsMemory(filled), ct).ConfigureAwait(false);
-                    if (n == 0)
-                    {
-                        eof = true;
-                        break;
-                    }
-                    filled += n;
-                }
-                await buffers.WriteAsync((buffer, filled, eof), ct).ConfigureAwait(false);
-                if (eof)
-                {
-                    buffers.TryComplete();
-                    return;
-                }
+                var result = await reader.ReadAsync(ct).ConfigureAwait(false);
+                var buffer = result.Buffer;
+                while (TryReadLine(buffer, start, ref parseAbs, window, result.IsCompleted, out var line))
+                    yield return line;
+
+                if (result.IsCompleted)
+                    break; // усечённый хвост TryReadLine бросил бы исключением
+
+                // consumed — только до обработанных записей: окно двигает Dispose в мерже.
+                var consumedRel = window.HasReleased ? checked(window.ReleasedEnd - start) : 0;
+                reader.AdvanceTo(buffer.GetPosition(consumedRel), buffer.End);
+                start += consumedRel;
             }
-        }
-        catch (Exception ex)
-        {
-            buffers.TryComplete(ex);
-            throw;
         }
         finally
         {
-            await stream.DisposeAsync().ConfigureAwait(false);
-        }
-    }
-
-    /// <summary>Вычислитель: разбирает порции в пакеты под CPU-слотом и кладёт в выходной канал.</summary>
-    private static async Task ComputeBatches(
-        ChannelReader<(byte[] Buffer, int Filled, bool Eof)> buffers,
-        ChannelWriter<Batch> channel,
-        Encoding encoding,
-        CompareInfo compareInfo,
-        CompareOptions compareOptions,
-        SemaphoreSlim cpuSlots,
-        CancellationToken ct)
-    {
-        byte[]? pending = null; // хвост незавершённой записи прошлой порции
-        var pendingLen = 0;
-        try
-        {
-            while (true)
-            {
-                var (buffer, filled, eof) = await buffers.ReadAsync(ct).ConfigureAwait(false);
-                if (filled == 0)
-                {
-                    ArrayPool<byte>.Shared.Return(buffer);
-                    break; // конец потока
-                }
-
-                byte[] batchBuffer;
-                if (pending is null)
-                {
-                    batchBuffer = buffer; // разбор на месте, буфер уходит пакету
-                }
-                else
-                {
-                    // Хвост прошлой порции + новые данные в свежий буфер — записи ссылаются на него.
-                    batchBuffer = ArrayPool<byte>.Shared.Rent(pendingLen + filled);
-                    Buffer.BlockCopy(pending, 0, batchBuffer, 0, pendingLen);
-                    Buffer.BlockCopy(buffer, 0, batchBuffer, pendingLen, filled);
-                    ArrayPool<byte>.Shared.Return(buffer);
-                }
-                var end = pendingLen + filled;
-
-                Batch batch;
-                int consumed;
-                await cpuSlots.WaitAsync(ct).ConfigureAwait(false);
-                try
-                {
-                    batch = ParseBatch(batchBuffer, end, encoding, compareInfo, compareOptions, eof, out consumed);
-                }
-                catch
-                {
-                    ArrayPool<byte>.Shared.Return(batchBuffer);
-                    throw;
-                }
-                finally
-                {
-                    cpuSlots.Release();
-                }
-
-                // Хвост незавершённой записи — в отдельный буфер; batchBuffer уходит пакету.
-                var tail = end - consumed;
-                var oldPending = pending;
-                if (tail > 0)
-                {
-                    pending = ArrayPool<byte>.Shared.Rent(tail);
-                    Buffer.BlockCopy(batchBuffer, consumed, pending, 0, tail);
-                    pendingLen = tail;
-                }
-                else
-                {
-                    pending = null;
-                    pendingLen = 0;
-                }
-                if (oldPending is not null)
-                    ArrayPool<byte>.Shared.Return(oldPending);
-
-                await channel.WriteAsync(batch, ct).ConfigureAwait(false);
-                if (eof)
-                    break; // eof-порция обработана — данных больше не будет
-            }
-            channel.TryComplete();
-        }
-        catch (Exception ex)
-        {
-            channel.TryComplete(ex);
-            throw;
+            await reader.CompleteAsync().ConfigureAwait(false);
         }
     }
 
     /// <summary>
-    /// Разбирает записи из среза буфера [0, end): тексты остаются в буфере (zero-copy),
-    /// значения δ-варинтов разворачиваются в общий массив, sort key вычисляются двумя пассами
-    /// (длины → запись). ordinal-режим: ключ не вычисляется, SortKey алиасит текст.
-    /// consumed — граница последней полной записи; на atEof хвост за ней — усечённая запись.
+    /// Читает запись с абсолютной позиции parseAbs. Запись пишется продюсером одним GetSpan —
+    /// целиком в одном сегменте. false — запись ещё не дописана в пайп; усечённый хвост при
+    /// atEof — FormatException.
     /// </summary>
-    private static Batch ParseBatch(
-        byte[] buffer, int end,
-        Encoding encoding,
-        CompareInfo compareInfo,
-        CompareOptions compareOptions,
-        bool atEof,
-        out int consumed)
+    private static bool TryReadLine(ReadOnlySequence<byte> buffer, long bufferStart, ref long parseAbs, ChunkWindow window, bool atEof, out ChunkLine line)
     {
-        List<BatchEntryMeta> metas = [];
-        List<long> values = [];
-        // Срез от начала буфера: TryReadVarint индексирует pos относительно начала среза,
-        // а pos здесь — абсолютное смещение в буфере.
-        var span = buffer.AsSpan(0, end);
-        var pos = 0;
-        while (pos < end)
+        line = default;
+        var rel = checked(parseAbs - bufferStart);
+        if (rel >= buffer.Length)
+            return false;
+
+        var rest = buffer.Slice(buffer.GetPosition(rel));
+        SequenceReader<byte> reader = new(rest);
+        if (!TryReadVarint(ref reader, out var textLength)
+            || reader.Remaining < checked((long)textLength))
+            return Incomplete(atEof);
+        var textOffset = checked((int)reader.Consumed);
+        reader.Advance(checked((long)textLength));
+        if (!TryReadVarint(ref reader, out var keyLength)
+            || reader.Remaining < checked((long)keyLength))
+            return Incomplete(atEof);
+        var keyOffset = checked((int)reader.Consumed);
+        reader.Advance(checked((long)keyLength));
+        if (!TryReadVarint(ref reader, out var count)
+            || reader.Remaining < checked((long)count * 8))
+            return Incomplete(atEof);
+        var valuesOffset = checked((int)reader.Consumed);
+
+        var recordLength = reader.Consumed + checked((long)count * 8);
+        var record = buffer.Slice(buffer.GetPosition(rel), recordLength);
+        if (!record.IsSingleSegment)
+            throw new InvalidOperationException("Record is not contiguous in the chunk pipe");
+        if (!MemoryMarshal.TryGetArray(record.First, out var segment) || segment.Array is not { } array)
+            throw new InvalidOperationException("Chunk pipe segment is not array-backed");
+        parseAbs += recordLength;
+        line = new ChunkLine(window, array,
+            segment.Offset + textOffset, checked((int)textLength),
+            segment.Offset + keyOffset, checked((int)keyLength),
+            segment.Offset + valuesOffset, checked((int)count),
+            parseAbs);
+        return true;
+
+        static bool Incomplete(bool atEof)
         {
-            var entryStart = pos;
-            if (!Extensions.TryReadVarint(span, ref pos, out var textLength)
-                || textLength > (ulong)(end - pos))
-            {
-                pos = entryStart;
-                break;
-            }
-            var textOffset = pos;
-            pos += (int)textLength;
-            if (!Extensions.TryReadVarint(span, ref pos, out var count))
-            {
-                pos = entryStart;
-                break;
-            }
-            var valuesStart = values.Count;
-            long previous = 0;
-            var complete = true;
-            for (ulong i = 0; i < count; i++)
-            {
-                if (!Extensions.TryReadVarint(span, ref pos, out var delta))
-                {
-                    complete = false;
-                    break;
-                }
-                previous += checked((long)delta);
-                values.Add(previous);
-            }
-            if (!complete)
-            {
-                pos = entryStart;
-                break;
-            }
-            metas.Add(new(textOffset, (int)textLength, valuesStart, checked((int)count)));
+            if (atEof)
+                throw new FormatException("Truncated entry at end of chunk file");
+            return false;
         }
-        consumed = pos;
-
-        // Отрезаем значения неполной записи, если она не влезла.
-        var totalValues = metas.Count == 0 ? 0 : metas[^1].ValuesStart + metas[^1].ValuesCount;
-        if (values.Count != totalValues)
-            values.RemoveRange(totalValues, values.Count - totalValues);
-
-        if (atEof && pos != end)
-            throw new FormatException("Truncated entry at end of chunk file");
-        if (metas.Count == 0)
-            throw new FormatException("Entry does not fit into the batch buffer");
-
-        var valuesArray = values.ToArray();
-        var entryCount = metas.Count;
-
-        Batch batch;
-        ReadChunkEntry[] entries = new ReadChunkEntry[entryCount];
-
-        if (compareOptions == CompareOptions.Ordinal)
-        {
-            batch = new Batch(buffer, null, entryCount);
-            // Ключ — байты текста: сегмент SortKey алиасит сегмент Text.
-            for (var i = 0; i < entryCount; i++)
-            {
-                var m = metas[i];
-                ArraySegment<byte> text = new(buffer, m.TextOffset, m.TextLength);
-                entries[i] = new(batch, text, text, valuesArray, m.ValuesStart, m.ValuesCount);
-            }
-        }
-        else
-        {
-            // Пасс A: точная длина sort key каждой записи.
-            var maxText = 0;
-            foreach (var m in metas)
-                maxText = Math.Max(maxText, m.TextLength);
-            var maxChars = encoding.GetMaxCharCount(maxText);
-            Span<char> chars = maxChars <= StackallocCharThreshold
-                ? stackalloc char[StackallocCharThreshold]
-                : new char[maxChars];
-            var keyLengths = new int[entryCount];
-            long totalKeys = 0;
-            for (var i = 0; i < entryCount; i++)
-            {
-                var m = metas[i];
-                var w = encoding.GetChars(buffer.AsSpan(m.TextOffset, m.TextLength), chars);
-                totalKeys += keyLengths[i] = compareInfo.GetSortKeyLength(chars[..w], compareOptions);
-            }
-            var keyOffsets = new int[entryCount + 1];
-            for (var i = 0; i < entryCount; i++)
-                keyOffsets[i + 1] = keyOffsets[i] + keyLengths[i];
-            var keyBuffer = ArrayPool<byte>.Shared.Rent(checked((int)totalKeys));
-
-            batch = new Batch(buffer, keyBuffer, entryCount);
-
-            // Пасс B: sort key каждой записи в общий буфер пакета.
-            for (var i = 0; i < entryCount; i++)
-            {
-                var m = metas[i];
-                var w = encoding.GetChars(buffer.AsSpan(m.TextOffset, m.TextLength), chars);
-                compareInfo.GetSortKey(chars[..w], keyBuffer.AsSpan(keyOffsets[i], keyLengths[i]), compareOptions);
-                entries[i] = new(batch,
-                    new ArraySegment<byte>(buffer, m.TextOffset, m.TextLength),
-                    new ArraySegment<byte>(keyBuffer, keyOffsets[i], keyLengths[i]),
-                    valuesArray, m.ValuesStart, m.ValuesCount);
-            }
-        }
-
-        batch.Entries = entries;
-        return batch;
     }
 
-    /// <summary>Адаптер канала пакетов к потоку записей для MergeSorted (Dispose каждой записи освобождает пакет).</summary>
-    internal static async IAsyncEnumerable<ReadChunkEntry> ReadEntries(
-        ChannelReader<Batch> reader,
-        [EnumeratorCancellation] CancellationToken ct = default)
+    private static bool TryReadVarint(ref SequenceReader<byte> reader, out ulong value)
     {
-        while (await reader.WaitToReadAsync(ct).ConfigureAwait(false))
+        value = 0;
+        ulong result = 0;
+        var shift = 0;
+        for (var i = 0; i < 10; i++)
         {
-            while (reader.TryRead(out var batch))
+            if (!reader.TryRead(out var b))
+                return false;
+            result |= (ulong)(b & 0x7F) << shift;
+            if ((b & 0x80) == 0)
             {
-                foreach (var entry in batch.Entries)
-                    yield return entry;
+                value = result;
+                return true;
             }
+            shift += 7;
         }
+        throw new FormatException("Varint is too long, file is corrupted");
     }
 
     public static async IAsyncEnumerable<V> MergeSorted<T,V>(
         this IEnumerable<IAsyncEnumerable<T>> sources,
         IComparer<T> comparer,
         Func<IReadOnlyList<T>, V> merge,
-        [EnumeratorCancellation] CancellationToken ct = default)
+        [EnumeratorCancellation] CancellationToken ct = default) where T : IDisposable
     {
         List<IAsyncEnumerator<T>> enumerators = [.. sources.Select(s => s.GetAsyncEnumerator(ct))];
         try
@@ -329,7 +144,7 @@ static class MergeExtensions
         List<IAsyncEnumerator<T>> enumerators,
         IComparer<T> comparer,
         Func<IReadOnlyList<T>, V> merge,
-        [EnumeratorCancellation] CancellationToken ct)
+        [EnumeratorCancellation] CancellationToken ct) where T : IDisposable
     {
         PriorityQueue<IAsyncEnumerator<T>, T> pq = new(enumerators.Count, comparer);
         List<T> group = new(enumerators.Count);
@@ -378,9 +193,9 @@ static class MergeExtensions
 
             yield return merge(group);
 
-            // Группа потреблена — возвращаем буферы записей в пулы.
+            // Группа потреблена — записи отдают свои байты пайпам.
             foreach (var entry in group)
-                (entry as IDisposable)?.Dispose();
+                entry.Dispose();
             group.Clear();
             groupSources.Clear();
         }
