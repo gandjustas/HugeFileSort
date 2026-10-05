@@ -27,19 +27,18 @@ sealed class LookupPoolPolicy : IPooledObjectPolicy<Dictionary<BufferString, Key
 }
 
 /// <summary>
-/// Сравнитель ключей Dictionary чанка: при добавлении нового ключа копирует альтернативу (байты текста)
-/// в привязанный буфер и возвращает BufferString — ключи не аллоцируют отдельные массивы.
-/// Ключи сравниваются как массивы байт (без учёта кодировки). При нехватке места в буфере бросает исключение.
+/// Сравнитель ключей Dictionary чанка (equality + хэш и alternate lookup по байтам текста):
+/// при добавлении нового ключа копирует альтернативу в привязанный буфер и возвращает
+/// BufferString — ключи не аллоцируют отдельные массивы. При нехватке места в буфере бросает исключение.
 /// </summary>
 sealed class BytesComparer : IEqualityComparer<BufferString>,
-    IAlternateEqualityComparer<ReadOnlySpan<byte>, BufferString>,
-    IComparer<BufferString>
+    IAlternateEqualityComparer<ReadOnlySpan<byte>, BufferString>
 {
     private byte[] buffer = [];
     private int bufferLength;
 
     /// <summary>Сколько байт занято под тексты в буфере текущего чанка.</summary>
-    public int Offset { get; private set; }
+    private int Offset { get; set; }
 
     /// <summary>Сколько байт с конца буфера занято парами (номер, значение).</summary>
     public int TailReserved { get; private set; }
@@ -73,9 +72,6 @@ sealed class BytesComparer : IEqualityComparer<BufferString>,
 
     public bool Equals(BufferString x, BufferString y) =>
         x.Offset == y.Offset && x.Length == y.Length || Slice(x).SequenceEqual(Slice(y));
-
-    public int Compare(BufferString x, BufferString y) =>
-        Slice(x).SequenceCompareTo(Slice(y));
 
     public int GetHashCode(ReadOnlySpan<byte> alternate) =>
         (int)System.IO.Hashing.XxHash32.HashToUInt32(alternate);

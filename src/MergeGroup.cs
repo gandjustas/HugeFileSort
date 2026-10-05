@@ -24,8 +24,7 @@ sealed class MergeGroup : IEnumerable<(Memory<byte>, long)>
     private static readonly int u32size = Unsafe.SizeOf<int>();
     private const int MetaPerRecord = 16; // 4 int на запись в хвостовом блоке меты
 
-    private ChunkEntry first;      // не материализованная одиночная запись
-    private bool hasFirst;
+    private ChunkEntry first;      // не материализованная одиночная запись (count == 1, !materialized)
     private bool materialized;
     private byte[]? buffer;        // групповая раскладка
     private int bufferSize;
@@ -43,10 +42,9 @@ sealed class MergeGroup : IEnumerable<(Memory<byte>, long)>
     {
         if (buffer is not null)
             ArrayPool<byte>.Shared.Return(buffer);
-        else if (hasFirst)
+        else if (count != 0)
             first.Return();
         first = default;
-        hasFirst = false;
         materialized = false;
         buffer = null;
         bufferSize = 0;
@@ -58,10 +56,9 @@ sealed class MergeGroup : IEnumerable<(Memory<byte>, long)>
 
     public bool TryAdd(in ChunkEntry entry)
     {
-        if (!hasFirst && !materialized)
+        if (count == 0)
         {
             first = entry;
-            hasFirst = true;
             count = 1;
             return true;
         }
@@ -116,7 +113,6 @@ sealed class MergeGroup : IEnumerable<(Memory<byte>, long)>
             buffer = newBuffer;
             first.Return();
             first = default;
-            hasFirst = false;
             materialized = true;
         }
         catch
@@ -163,8 +159,7 @@ sealed class MergeGroup : IEnumerable<(Memory<byte>, long)>
         var needed = dataEnd + additional + (count + 1) * MetaPerRecord;
         var newBuffer = ArrayPool<byte>.Shared.Rent(Math.Max(bufferSize * 2, needed));
         buffer!.AsSpan(0, dataEnd).CopyTo(newBuffer);
-        if (metaBytes > 0)
-            buffer.AsSpan(bufferSize - metaBytes, metaBytes).CopyTo(newBuffer.AsSpan(newBuffer.Length - metaBytes));
+        buffer.AsSpan(bufferSize - metaBytes, metaBytes).CopyTo(newBuffer.AsSpan(newBuffer.Length - metaBytes));
         ArrayPool<byte>.Shared.Return(buffer!);
         buffer = newBuffer;
         bufferSize = newBuffer.Length;
@@ -172,7 +167,7 @@ sealed class MergeGroup : IEnumerable<(Memory<byte>, long)>
 
     public IEnumerator<(Memory<byte>, long)> GetEnumerator()
     {
-        if (!hasFirst && !materialized)
+        if (count == 0)
             throw new InvalidOperationException("Empty merge group");
 
         if (!materialized)

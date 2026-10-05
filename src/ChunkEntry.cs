@@ -1,7 +1,5 @@
 using System.Buffers;
-using System.Buffers.Binary;
 using System.Globalization;
-using System.IO.Hashing;
 using System.Runtime.InteropServices;
 using System.Text;
 
@@ -11,14 +9,11 @@ using System.Text;
 /// массиве — раскладка [текст][ключ][значения]. Владеет массивом: после записи группы
 /// Return() возвращает его в пул.
 /// </summary>
-readonly struct ChunkEntry(byte[] rented, int hash, ArraySegment<byte> key, ArraySegment<byte> text, ArraySegment<byte> values, int valuesCount)
+readonly struct ChunkEntry(byte[] rented, ArraySegment<byte> key, ArraySegment<byte> text, ArraySegment<byte> values, int valuesCount)
 {
     private const int StackCharLimit = 4096;
 
     private readonly byte[] buffer = rented;
-
-    /// <summary>Хэш байтов ключа, посчитан парсером чанка.</summary>
-    public int Hash { get; } = hash;
 
     /// <summary>Байты ключа (culture — sort key, ordinal — текст).</summary>
     public ArraySegment<byte> Key { get; } = key;
@@ -42,11 +37,14 @@ readonly struct ChunkEntry(byte[] rented, int hash, ArraySegment<byte> key, Arra
         // Ключ: ordinal — срез текста; culture — sort key (длина известна после декодирования чаров).
         var maxChars = ordinal ? 0 : encoding.GetMaxCharCount(textSize);
         char[]? rentedChars = maxChars > StackCharLimit ? ArrayPool<char>.Shared.Rent(maxChars) : null;
-        Span<char> chars = maxChars > StackCharLimit ? rentedChars!.AsSpan() : stackalloc char[StackCharLimit];
-        int written = 0;
+        // Чары читает только culture-путь, а localloc stackalloc-тернарника исполняется
+        // безусловно — ordinal резервирует минимальный стек вместо 8КБ на запись.
+        Span<char> chars = stackalloc char[ordinal ? 1 : StackCharLimit];
+        if (maxChars > StackCharLimit)
+            chars = rentedChars!.AsSpan();
         if (!ordinal)
         {
-            written = encoding.GetChars(text, chars);
+            var written = encoding.GetChars(text, chars);
             chars = chars[..written];
         }
         var keySize = ordinal ? textSize : compareInfo.GetSortKeyLength(chars, compareOptions);
@@ -65,7 +63,7 @@ readonly struct ChunkEntry(byte[] rented, int hash, ArraySegment<byte> key, Arra
             if (!ordinal)
                 compareInfo.GetSortKey(chars, key, compareOptions);
             Unfold(rawValues, values);
-            return new ChunkEntry(buffer, (int)XxHash32.HashToUInt32(key.AsSpan()), key, textSegment, values, (int)valuesCount);
+            return new ChunkEntry(buffer, key, textSegment, values, (int)valuesCount);
         }
         catch
         {
@@ -126,4 +124,13 @@ readonly struct ChunkEntry(byte[] rented, int hash, ArraySegment<byte> key, Arra
         if (i != targetLongs.Length)
             throw new FormatException("Chunk record values are truncated");
     }
+}
+
+/// <summary>Порядок записей: побайтовое сравнение ключей (culture — sort key, ordinal — текст).</summary>
+sealed class ChunkEntryComparer : IComparer<ChunkEntry>
+{
+    public static readonly ChunkEntryComparer Instance = new();
+
+    public int Compare(ChunkEntry x, ChunkEntry y) =>
+        x.Key.AsSpan().SequenceCompareTo(y.Key.AsSpan());
 }

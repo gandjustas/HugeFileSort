@@ -5,7 +5,7 @@ using System.Runtime.InteropServices;
 /// <summary>
 /// Стадия отсортированного чанка: текстовый буфер (принят от Chunk), CSR-массив значений,
 /// границы значений и текстов, порядок записи — все массивы арендованы из пулов и
-/// возвращаются в Dispose. SerializedSize/Serialize готовят данные к сжатию,
+/// возвращаются в Dispose. Serialize готовит данные к сжатию,
 /// Compress выполняет переход в CompressedChunk (Dispose вызывается сразу после Serialize).
 /// </summary>
 sealed class SortedChunk(
@@ -26,7 +26,7 @@ sealed class SortedChunk(
     /// чисел) — для каждого ключа в порядке Order, возвращает записанный размер. Sort key в файл
     /// не пишутся — merge пересчитывает их пакетами.
     /// </summary>
-    public int Serialize(Span<byte> dst)
+    private int Serialize(Span<byte> dst)
     {
         var values = MemoryMarshal.Cast<byte, long>(valuesBuffer.AsSpan());
         var keyOffsets = MemoryMarshal.Cast<byte, int>(keyOffsetBuffer.AsSpan())[..keyCount];

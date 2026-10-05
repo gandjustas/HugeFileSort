@@ -35,9 +35,6 @@ internal partial class MergeCliCommand
         ValidationRules = CliValidationRules.LegalPath)]
     public FileInfo Destination { get; set; } = null!;
 
-    [CliOption(Name = "flush-mb", Description = "Unflushed bytes threshold for the output writer, MB (default: 32)")]
-    public int FlushMb { get; set; } = 32;
-
     [CliOption(Name = "compare-options", Description = "Text comparison used at split: None (default), Ordinal, IgnoreCase, IgnoreNonSpace, IgnoreSymbols, or a combination")]
     public string CompareOptionsName { get; set; } = "None";
 
@@ -56,11 +53,7 @@ internal partial class MergeCliCommand
     private static async IAsyncEnumerable<string> ReadStdinLines([EnumeratorCancellation] CancellationToken ct = default)
     {
         while (Console.ReadLine() is { } line)
-        {
-            line = line.Trim();
-            if (line.Length != 0)
-                yield return line;
-        }
+            yield return line;
     }
 
     /// <summary>Мержит чанки в Destination с готовыми настройками; используется и командой sort. Возвращает список чанков.</summary>
@@ -68,19 +61,15 @@ internal partial class MergeCliCommand
     {
         Stopwatch sw = Stopwatch.StartNew();
 
-        this.encoding = encoding;
-        this.compareOptions = compareOptions;
-        isOrdinal = compareOptions == CompareOptions.Ordinal;
-        compareInfo = CultureInfo.CurrentCulture.CompareInfo;
-
-        memoryPool = new ScratchMemoryPool(ArrayPool<byte>.Create(8 * MinimumSegmentSize,
+        var isOrdinal = compareOptions == CompareOptions.Ordinal;
+        var compareInfo = CultureInfo.CurrentCulture.CompareInfo;
+        var memoryPool = new ScratchMemoryPool(ArrayPool<byte>.Create(8 * MinimumSegmentSize,
             (int)(GC.GetGCMemoryInfo().TotalAvailableMemoryBytes / MinimumSegmentSize / 8 / 2)), 8 * MinimumSegmentSize);
-
-        newLine = encoding.GetBytes(Environment.NewLine);
-        dotSpace = encoding.GetBytes(". ");
+        var newLine = encoding.GetBytes(Environment.NewLine);
+        var dotSpace = encoding.GetBytes(". ");
 
         using FileStream output = new(Destination.FullName, FileMode.Create, FileAccess.Write, FileShare.None,
-            bufferSize: OutputBufferSize, FileOptions.SequentialScan);
+            bufferSize: OutputBufferSize);
         if (PreallocatedLength is { } size)
             output.SetLength(size);
         output.Seek(0, SeekOrigin.Begin);
@@ -89,7 +78,7 @@ internal partial class MergeCliCommand
         ObjectPool<MergeGroup> groupPool = new DefaultObjectPool<MergeGroup>(new MergeGroupPoolPolicy());
         ActionBlock<MergeGroup> writer = new(group =>
         {
-            WriteGroup(group, output);
+            WriteGroup(group, output, encoding, dotSpace, newLine);
             groupPool.Return(group);
         }, new ExecutionDataflowBlockOptions
         {
@@ -123,14 +112,13 @@ internal partial class MergeCliCommand
                 producers.Add(ProduceChunk(trimmed, chunkPipe.Writer, ct));
                 Channel<ChunkEntry> channel = Channel.CreateBounded<ChunkEntry>(ChannelCapacity);
                 channels.Add(channel);
-                materializers.Add(MaterializeChunk(chunkPipe.Reader, channel.Writer, ct));
+                materializers.Add(MaterializeChunk(chunkPipe.Reader, channel.Writer, isOrdinal, encoding, compareInfo, compareOptions, ct));
                 sources.Add(channel.Reader.ReadAllAsync(ct));
             }
 
             await foreach (var group in sources.MergeSorted(
                 ChunkEntryComparer.Instance,
-                groupPool.Get,
-                static (group, entry) => group.TryAdd(in entry),
+                groupPool,
                 ct).WithCancellation(ct).ConfigureAwait(false))
             {
                 await writer.SendAsync(group, ct).ConfigureAwait(false);
@@ -154,8 +142,7 @@ internal partial class MergeCliCommand
         }
         writer.Complete();
         await writer.Completion.ConfigureAwait(false);
-        await Task.WhenAll(producers).ConfigureAwait(false);
-        await Task.WhenAll(materializers).ConfigureAwait(false);
+        await Task.WhenAll(producers.Concat(materializers)).ConfigureAwait(false);
 
         if (PreallocatedLength is not null)
             output.SetLength(output.Position);
@@ -173,7 +160,6 @@ internal partial class MergeCliCommand
     {
         try
         {
-            ct.ThrowIfCancellationRequested();
             // Большой буфер FileStream: ОС получает последовательные чтения по 4МБ независимо
             // от чередования чтений сотен чанков — мелкие запросы роняют полосу HDD в разы.
             using FileStream fileStream = new(path, FileMode.Open, FileAccess.Read, FileShare.Read,
@@ -206,17 +192,18 @@ internal partial class MergeCliCommand
 
     /// <summary>
     /// Парсер чанка: разбирает пайп в записи, материализует каждую в ChunkEntry (аренда массива,
-    /// текст + ключ + развёрнутые значения, хэш ключа) и кладёт в ограниченный канал — сортировка
-    /// ключей идёт параллельно по всем чанкам.
+    /// текст + ключ + развёрнутые значения) и кладёт в ограниченный канал — сортировка ключей
+    /// идёт параллельно по всем чанкам.
     /// </summary>
-    private async Task MaterializeChunk(PipeReader reader, ChannelWriter<ChunkEntry> channel, CancellationToken ct)
+    private static async Task MaterializeChunk(PipeReader reader, ChannelWriter<ChunkEntry> channel,
+        bool ordinal, Encoding encoding, CompareInfo compareInfo, CompareOptions compareOptions, CancellationToken ct)
     {
         try
         {
             await foreach (var raw in reader.ReadLines(ct).ConfigureAwait(false))
             {
                 var entry = ChunkEntry.Create(raw.Text, raw.Values, raw.Count,
-                    isOrdinal, encoding, compareInfo, compareOptions);
+                    ordinal, encoding, compareInfo, compareOptions);
                 await channel.WriteAsync(entry, ct).ConfigureAwait(false);
             }
             channel.TryComplete();
@@ -227,27 +214,18 @@ internal partial class MergeCliCommand
         }
     }
 
-    private MemoryPool<byte> memoryPool = null!;
-    private byte[] newLine = null!;
-    private byte[] dotSpace = null!;
-
-    Encoding encoding = Encoding.UTF8;
-    CompareOptions compareOptions = CompareOptions.None;
-    private bool isOrdinal;
-    private CompareInfo compareInfo = null!;
-
     /// <summary>
     /// Пишет группу записей с равным ключом: значения каждой записи по возрастанию
     /// (культурно равные тексты, например канонически эквивалентные формы, сливаются в общий
     /// порядок). Одиночная запись пишется прямо из её сегментов, без копий.
     /// </summary>
-    private void WriteGroup(MergeGroup group, FileStream output)
+    private static void WriteGroup(MergeGroup group, FileStream output, Encoding encoding, byte[] dotSpace, byte[] newLine)
     {
         foreach (var (text, value) in group)
-            WriteEntry(value, text.Span, output);
+            WriteEntry(value, text.Span, output, encoding, dotSpace, newLine);
     }
 
-    private void WriteEntry(long value, Span<byte> text, FileStream stream)
+    private static void WriteEntry(long value, Span<byte> text, FileStream stream, Encoding encoding, byte[] dotSpace, byte[] newLine)
     {
         Span<char> number = stackalloc char[32];
         value.TryFormat(number, out var digits, null, null);

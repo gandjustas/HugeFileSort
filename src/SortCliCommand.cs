@@ -30,9 +30,6 @@ internal partial class SortCliCommand
     [CliOption(Name = "max-chunk-mb", Description = "Upper bound of the adaptive chunk buffer, MB (default: 500)")]
     public int MaxChunkMb { get; set; } = 500;
 
-    [CliOption(Name = "flush-mb", Description = "Unflushed bytes threshold for the output writer, MB (default: 32)")]
-    public int FlushMb { get; set; } = 32;
-
     [CliOption(Name = "zstd-level", Description = "Zstd compression level for chunk files, 1-22 (default: 9)")]
     public int ZstdLevel { get; set; } = 9;
 
@@ -62,7 +59,6 @@ internal partial class SortCliCommand
         MergeCliCommand merge = new()
         {
             Destination = Destination ?? new FileInfo(Path.ChangeExtension(Source.FullName, ".sorted" + Path.GetExtension(Source.FullName))),
-            FlushMb = FlushMb,
             CompareOptionsName = CompareOptionsName,
             PreallocatedLength = Source.Length,
         };
