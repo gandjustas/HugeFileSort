@@ -18,7 +18,7 @@ internal partial class SortCliCommand
         Arity = CliArgumentArity.ZeroOrOne, ValidationRules = CliValidationRules.LegalPath)]
     public FileInfo? Destination { get; set; }
 
-    [CliOption(Name = "parallel", Description = "Number of chunks sorted in parallel (default: 1)")]
+    [CliOption(Name = "parallel", Description = "Lower bound of the sorter/compressor blocks count; at least a quarter of the cores is always used (default: 1)")]
     public int Parallelism { get; set; } = 1;
 
     [CliOption(Name = "compare-options", Description = "Text comparison: None (default), Ordinal, IgnoreCase, IgnoreNonSpace, IgnoreSymbols, or a combination")]

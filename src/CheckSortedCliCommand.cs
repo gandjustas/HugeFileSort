@@ -15,7 +15,7 @@ internal partial class CheckSortedCliCommand
     public Task<int> RunAsync(CliContext context) =>
         RootCliCommand.RunWithSettingsAsync(CompareOptionsName, CheckAsync, context);
 
-    private async Task<int> CheckAsync(Encoding encoding, CompareOptions compareOptions, CancellationToken ct)
+    internal async Task<int> CheckAsync(Encoding encoding, CompareOptions compareOptions, CancellationToken ct)
     {
         var compareInfo = CultureInfo.CurrentCulture.CompareInfo;
         var newLine = encoding.GetBytes(Environment.NewLine);

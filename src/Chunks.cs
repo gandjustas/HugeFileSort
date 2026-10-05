@@ -37,6 +37,9 @@ sealed class BytesComparer : IEqualityComparer<BufferString>,
     private byte[] buffer = [];
     private int bufferLength;
 
+    /// <summary>Размер пары (номер, значение) в хвосте буфера.</summary>
+    public const int PairBytes = 16;
+
     /// <summary>Сколько байт занято под тексты в буфере текущего чанка.</summary>
     private int Offset { get; set; }
 
@@ -44,7 +47,7 @@ sealed class BytesComparer : IEqualityComparer<BufferString>,
     public int TailReserved { get; private set; }
 
     /// <summary>Резервирует место под очередную пару (номер, значение) в конце буфера.</summary>
-    public void ReservePair() => TailReserved += 16;
+    public void ReservePair() => TailReserved += PairBytes;
 
     /// <summary>Свободно байт между текстами (от начала) и парами (с конца).</summary>
     public int Free => bufferLength - Offset - TailReserved;

@@ -28,7 +28,7 @@ internal partial class SplitCliCommand
     [CliArgument(Description = "Source file to split", ValidationRules = CliValidationRules.ExistingFile)]
     public FileInfo Source { get; set; } = null!;
 
-    [CliOption(Name = "parallel", Description = "Number of chunks sorted in parallel (default: 1)")]
+    [CliOption(Name = "parallel", Description = "Lower bound of the sorter/compressor blocks count; at least a quarter of the cores is always used (default: 1)")]
     public int Parallelism { get; set; } = 1;
 
     [CliOption(Name = "compare-options", Description = "Text comparison: None (default), Ordinal, IgnoreCase, IgnoreNonSpace, IgnoreSymbols, or a combination")]
@@ -84,14 +84,15 @@ internal partial class SplitCliCommand
         dotSpace = encoding.GetBytes(". ");
         bufferSize = ComputeBufferSize(Source.Length, MinChunkMb, MaxChunkMb);
         windowLog2 = ComputeWindowLog2(Source.Length, bufferSize);
-        pools = new ChunkPools(bufferSize, Math.Max(Parallelism, 4));
+        var stages = ComputeStages(Parallelism);
+        pools = new ChunkPools(bufferSize, Math.Max(stages, 4));
 
         TransformBlock<Chunk, SortedChunk> sorter = new(
             chunk => chunk.Sort(encoding, compareInfo, compareOptions, isOrdinal, ct),
             new ()
             {
-                MaxDegreeOfParallelism = Parallelism,
-                BoundedCapacity = Parallelism + 2,
+                MaxDegreeOfParallelism = stages,
+                BoundedCapacity = stages + 2,
                 EnsureOrdered = false,
                 CancellationToken = ct,
             });
@@ -99,8 +100,8 @@ internal partial class SplitCliCommand
             sorted => sorted.Compress(ZstdLevel, windowLog2),
             new ()
             {
-                MaxDegreeOfParallelism = Parallelism,
-                BoundedCapacity = Parallelism + 2,
+                MaxDegreeOfParallelism = stages,
+                BoundedCapacity = stages + 2,
                 EnsureOrdered = false,
                 CancellationToken = ct,
             });
@@ -157,6 +158,12 @@ internal partial class SplitCliCommand
     private static int ComputeBufferSize(long fileLength, int minChunkMb, int maxChunkMb) =>
         (int)Math.Clamp(fileLength / (Environment.ProcessorCount * 2L), minChunkMb * 1024L * 1024L, maxChunkMb * 1024L * 1024L);
 
+    /// <summary>
+    /// Число стадий сортировки и сжатия: четверть ядер, но не меньше нижней границы --parallel.
+    /// </summary>
+    internal static int ComputeStages(int parallelism) =>
+        Math.Max(parallelism, Environment.ProcessorCount / 4);
+
     /// <summary>Логарифм окна zstd: не больше размера чанка и в бюджете ~2ГБ на все параллельные декодеры merge.</summary>
     private static int ComputeWindowLog2(long fileLength, int chunkBufferBytes)
     {
@@ -210,8 +217,11 @@ internal partial class SplitCliCommand
             if (!reader.TryReadTo(out ReadOnlySpan<byte> number, dotSpace)) throw new FormatException($"Line does not contain '{Encoding.UTF8.GetString(dotSpace)}' delimiter");
             var x = ParseNumber(number);
 
-            // До конца строки — текст; пытаемся добавить его в словарь чанка.
+            // До конца строки — текст; строка, не помещающаяся в пустой чанк, не поместится ни в один.
             var text = reader.Sequence.Slice(reader.Position);
+            if (text.Length > pools.BufferSize - BytesComparer.PairBytes)
+                throw new InvalidDataException(
+                    $"Line text of {text.Length} bytes exceeds the chunk buffer of {pools.BufferSize} bytes. Increase --min-chunk-mb.");
             try
             {
                 AddToChunk(chunk, x, text);
