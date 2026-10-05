@@ -105,21 +105,31 @@ sealed class SortKeyComparer(byte[] sortKeys, byte[] offsets, byte[] lengths) : 
 }
 
 /// <summary>
-/// MemoryPool поверх ArrayPool: сегменты Pipe берутся из общего Scratch-пула.
+/// MemoryPool поверх ArrayPool: сегменты Pipe берутся из общего Scratch-пула. Аренда больше
+/// максимального размера пула (рост буферов групп и кэша sort key) — обычный массив мимо пула.
 /// </summary>
-sealed class ScratchMemoryPool(ArrayPool<byte> pool) : MemoryPool<byte>
+sealed class ScratchMemoryPool(ArrayPool<byte> pool, int maxPooled) : MemoryPool<byte>
 {
     public override int MaxBufferSize => int.MaxValue;
 
-    public override IMemoryOwner<byte> Rent(int minBufferSize = -1) => new Owner(pool.Rent(minBufferSize), pool);
+    public override IMemoryOwner<byte> Rent(int minBufferSize = -1)
+    {
+        if (minBufferSize <= maxPooled)
+            return new Owner(pool.Rent(minBufferSize), pool, skipReturn: false);
+        return new Owner(new byte[minBufferSize], pool, skipReturn: true);
+    }
 
     protected override void Dispose(bool disposing) { }
 
-    private sealed class Owner(byte[] array, ArrayPool<byte> pool) : IMemoryOwner<byte>
+    private sealed class Owner(byte[] array, ArrayPool<byte> pool, bool skipReturn) : IMemoryOwner<byte>
     {
         public Memory<byte> Memory => array;
 
-        public void Dispose() => pool.Return(array);
+        public void Dispose()
+        {
+            if (!skipReturn)
+                pool.Return(array);
+        }
     }
 }
 
@@ -137,10 +147,11 @@ sealed class ChunkPools
         // попадал в верхний bucket. maxArraysPerBucket с запасом покрывает сегменты Pipe
         // (pause 16МБ / 1МБ сегмент = ~16 шт только на чтение входного файла) + sort key + S/C.
         // Запас x2: culture-режим держит в Scratch конкатенированные чары всех ключей (~2x текстовых байт).
+        var scratchMaxLength = (int)Math.Min(int.MaxValue, 2L * BitOperations.RoundUpToPowerOf2((uint)bufferSize));
         Scratch = ArrayPool<byte>.Create(
-            (int)Math.Min(int.MaxValue, 2L * BitOperations.RoundUpToPowerOf2((uint)bufferSize)),
+            scratchMaxLength,
             Math.Max(32, maxConcurrent * 8));
-        Memory = new ScratchMemoryPool(Scratch);
+        Memory = new ScratchMemoryPool(Scratch, scratchMaxLength);
         Lookups = new DefaultObjectPool<Dictionary<BufferString, KeyInfo>>(new LookupPoolPolicy());
     }
 
@@ -294,7 +305,7 @@ sealed class Chunk : IDisposable
         TensorPrimitives.Subtract(valueOffsets, valueCounts, valueOffsets);
 
         byte[]? sortKeyBuffer = null, sortKeyOffsetBuffer = null, sortKeyLengthBuffer = null;
-        Span<int> sortKeyOffsets = [], sortKeyLengths = [];
+        Span<int> sortKeyOffsets, sortKeyLengths;
         if (!ordinal)
         {
             // Пасс A: длина sort key каждого ключа — параллельно, вход — уже декодированные чары.

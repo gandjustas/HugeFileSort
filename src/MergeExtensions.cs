@@ -1,203 +1,125 @@
-using System.Buffers;
-using System.IO.Pipelines;
 using System.Runtime.CompilerServices;
-using System.Runtime.InteropServices;
 
 static class MergeExtensions
 {
     /// <summary>
-    /// Разбирает буфер пайпа чанка в перечисление записей. Формат записи в пайпе:
-    /// [varint textLen][text][varint keyLen][key][varint count][count×long].
-    /// consumed двигается только до последней обработанной записи: ChunkLine.Dispose двигает
-    /// окно, итератор делает AdvanceTo не дальше него, поэтому мерж может держать записи групп
-    /// (в том числе по две у одного источника при lookahead), а пайп не переиспользует их байты.
-    /// Позиции ведутся в абсолютных байтах потока чанка: каждая AdvanceTo строится через
-    /// GetPosition текущего буфера, объекты SequencePosition через границы ReadAsync не хранятся.
+    /// N-way merge по сортированным источникам: группы равных ключей собираются через
+    /// tryAdd (группа сама сравнивает с ключом группы и материализует запись в свой буфер);
+    /// merge возвращает результат группы, после чего группа диспо́зится.
     /// </summary>
-    public static async IAsyncEnumerable<ChunkLine> ReadLines(
-        this PipeReader reader,
-        [EnumeratorCancellation] CancellationToken ct = default)
-    {
-        ChunkWindow window = new();
-        var start = 0L;     // абсолютная позиция начала буфера (= байт уже отдано consumed)
-        var parseAbs = 0L;  // абсолютная позиция следующей неразобранной записи
-        try
-        {
-            while (true)
-            {
-                var result = await reader.ReadAsync(ct).ConfigureAwait(false);
-                var buffer = result.Buffer;
-                while (TryReadLine(buffer, start, ref parseAbs, window, result.IsCompleted, out var line))
-                    yield return line;
-
-                if (result.IsCompleted)
-                    break; // усечённый хвост TryReadLine бросил бы исключением
-
-                // consumed — только до обработанных записей: окно двигает Dispose в мерже.
-                var consumedRel = window.HasReleased ? checked(window.ReleasedEnd - start) : 0;
-                reader.AdvanceTo(buffer.GetPosition(consumedRel), buffer.End);
-                start += consumedRel;
-            }
-        }
-        finally
-        {
-            await reader.CompleteAsync().ConfigureAwait(false);
-        }
-    }
-
-    /// <summary>
-    /// Читает запись с абсолютной позиции parseAbs. Запись пишется продюсером одним GetSpan —
-    /// целиком в одном сегменте. false — запись ещё не дописана в пайп; усечённый хвост при
-    /// atEof — FormatException.
-    /// </summary>
-    private static bool TryReadLine(ReadOnlySequence<byte> buffer, long bufferStart, ref long parseAbs, ChunkWindow window, bool atEof, out ChunkLine line)
-    {
-        line = default;
-        var rel = checked(parseAbs - bufferStart);
-        if (rel >= buffer.Length)
-            return false;
-
-        var rest = buffer.Slice(buffer.GetPosition(rel));
-        SequenceReader<byte> reader = new(rest);
-        if (!TryReadVarint(ref reader, out var textLength)
-            || reader.Remaining < checked((long)textLength))
-            return Incomplete(atEof);
-        var textOffset = checked((int)reader.Consumed);
-        reader.Advance(checked((long)textLength));
-        if (!TryReadVarint(ref reader, out var keyLength)
-            || reader.Remaining < checked((long)keyLength))
-            return Incomplete(atEof);
-        var keyOffset = checked((int)reader.Consumed);
-        reader.Advance(checked((long)keyLength));
-        if (!TryReadVarint(ref reader, out var count)
-            || reader.Remaining < checked((long)count * 8))
-            return Incomplete(atEof);
-        var valuesOffset = checked((int)reader.Consumed);
-
-        var recordLength = reader.Consumed + checked((long)count * 8);
-        var record = buffer.Slice(buffer.GetPosition(rel), recordLength);
-        if (!record.IsSingleSegment)
-            throw new InvalidOperationException("Record is not contiguous in the chunk pipe");
-        if (!MemoryMarshal.TryGetArray(record.First, out var segment) || segment.Array is not { } array)
-            throw new InvalidOperationException("Chunk pipe segment is not array-backed");
-        parseAbs += recordLength;
-        line = new ChunkLine(window, array,
-            segment.Offset + textOffset, checked((int)textLength),
-            segment.Offset + keyOffset, checked((int)keyLength),
-            segment.Offset + valuesOffset, checked((int)count),
-            parseAbs);
-        return true;
-
-        static bool Incomplete(bool atEof)
-        {
-            if (atEof)
-                throw new FormatException("Truncated entry at end of chunk file");
-            return false;
-        }
-    }
-
-    private static bool TryReadVarint(ref SequenceReader<byte> reader, out ulong value)
-    {
-        value = 0;
-        ulong result = 0;
-        var shift = 0;
-        for (var i = 0; i < 10; i++)
-        {
-            if (!reader.TryRead(out var b))
-                return false;
-            result |= (ulong)(b & 0x7F) << shift;
-            if ((b & 0x80) == 0)
-            {
-                value = result;
-                return true;
-            }
-            shift += 7;
-        }
-        throw new FormatException("Varint is too long, file is corrupted");
-    }
-
-    public static async IAsyncEnumerable<V> MergeSorted<T,V>(
+    public static async IAsyncEnumerable<V> MergeSorted<T, V>(
         this IEnumerable<IAsyncEnumerable<T>> sources,
         IComparer<T> comparer,
-        Func<IReadOnlyList<T>, V> merge,
-        [EnumeratorCancellation] CancellationToken ct = default) where T : IDisposable
+        Func<V> newMergeGroup,
+        Func<V, T, bool> tryAddToMergeGroup,
+        [EnumeratorCancellation] CancellationToken ct = default)
     {
         List<IAsyncEnumerator<T>> enumerators = [.. sources.Select(s => s.GetAsyncEnumerator(ct))];
+        // Полёт: MoveNext-задачи источников, чья текущая запись отдана в группу/хип.
+        // Живёт между группами: незавершённые задачи дожидаются в следующих группах.
+        List<(IAsyncEnumerator<T> Enumerator, Task<bool> Task)> flight = [];
         try
         {
-            await foreach (var x in MergeSortedWithPriorityQueue(enumerators, comparer, merge, ct).ConfigureAwait(false))
+            await foreach (var x in MergeSortedWithPriorityQueue(enumerators, comparer, newMergeGroup, tryAddToMergeGroup, flight, ct).ConfigureAwait(false))
             {
                 yield return x;
             }
         }
         finally
         {
-
+            // Досрочно выходим (ошибка/отмена/конец по ct): дожидаемся полёт, затем энумераторы.
+            foreach (var (_, task) in flight)
+            {
+                try { await task.ConfigureAwait(false); }
+                catch { /* источник уже упал — ошибка и так увидена мержем */ }
+            }
             foreach (var e in enumerators)
             {
-                await e.DisposeAsync();
+                await e.DisposeAsync().ConfigureAwait(false);
             }
         }
     }
 
-    static async IAsyncEnumerable<V> MergeSortedWithPriorityQueue<T,V>(
+    static async IAsyncEnumerable<V> MergeSortedWithPriorityQueue<T, V>(
         List<IAsyncEnumerator<T>> enumerators,
         IComparer<T> comparer,
-        Func<IReadOnlyList<T>, V> merge,
-        [EnumeratorCancellation] CancellationToken ct) where T : IDisposable
+        Func<V> newMergeGroup,
+        Func<V, T, bool> tryAddToMergeGroup,
+        List<(IAsyncEnumerator<T> Enumerator, Task<bool> Task)> flight,
+        [EnumeratorCancellation] CancellationToken ct)
     {
+        // Параллельный первичный наполн: каждый источник ждёт свой пайп независимо.
+        var initial = new Task<bool>[enumerators.Count];
+        for (var i = 0; i < enumerators.Count; i++)
+            initial[i] = enumerators[i].MoveNextAsync().AsTask();
+        await Task.WhenAll(initial).ConfigureAwait(false);
+
         PriorityQueue<IAsyncEnumerator<T>, T> pq = new(enumerators.Count, comparer);
-        List<T> group = new(enumerators.Count);
-        List<IAsyncEnumerator<T>> groupSources = new(enumerators.Count);
-        foreach (var e in enumerators)
+        for (var i = 0; i < enumerators.Count; i++)
         {
-            if (await e.MoveNextAsync().ConfigureAwait(false))
-            {
-                pq.Enqueue(e, e.Current);
-            }
+            if (initial[i].Result)
+                pq.Enqueue(enumerators[i], enumerators[i].Current);
         }
-        while (pq.TryDequeue(out var current, out var x))
+
+        while (pq.TryDequeue(out var current, out _))
         {
             ct.ThrowIfCancellationRequested();
-            // Собираем группу равных (по компаратору) элементов: записи — в group,
-            // их потоки — в groupSources (индексы совпадают).
-            group.Add(current.Current);
-            groupSources.Add(current);
-            while (pq.TryPeek(out var e, out var y) && comparer.Compare(x, y) == 0)
-            {
-                group.Add(e.Current);
-                groupSources.Add(e);
-                pq.Dequeue();
-            }
+            var group = newMergeGroup();
+            if (!tryAddToMergeGroup(group, current.Current))
+                throw new InvalidOperationException("New group rejected the first entry");
+            Advance(current);
 
-            // Lookahead до отдачи группы: поток может выдать ещё одну равную запись —
-            // она присоединяется к той же группе (и будет проверена на своей итерации),
-            // иначе значения культурно равных ключей одного потока не сольются и
-            // глобальный порядок значений нарушится.
-            for (var i = 0; i < groupSources.Count; i++)
+            var more = true;
+            while (more)
             {
-                var enumerator = groupSources[i];
-                if (await enumerator.MoveNextAsync().ConfigureAwait(false))
+                more = false;
+                // Сбор равных из хипа: группа сравнивает с ключом группы; не равная остаётся в хипе.
+                while (pq.TryPeek(out var e, out _) && tryAddToMergeGroup(group, e.Current))
                 {
-                    if (comparer.Compare(enumerator.Current, x) == 0)
+                    pq.Dequeue();
+                    Advance(e);
+                    more = true;
+                }
+                if (flight.Count > 0)
+                {
+                    // Ждём завершившиеся MoveNext; результат true — запись в хип (может быть равной).
+                    var snapshot = flight.Select(pair => pair.Task).ToArray();
+                    await foreach (var task in Task.WhenEach(snapshot).WithCancellation(ct).ConfigureAwait(false))
                     {
-                        group.Add(enumerator.Current);
-                        groupSources.Add(enumerator);
+                        IAsyncEnumerator<T>? enumerator = null;
+                        flight.RemoveAll(pair =>
+                        {
+                            if (pair.Task != task) return false;
+                            enumerator ??= pair.Enumerator;
+                            return true;
+                        });
+                        if (enumerator is not null && await task.ConfigureAwait(false))
+                            pq.Enqueue(enumerator, enumerator.Current);
                     }
-                    else
-                    {
-                        pq.Enqueue(enumerator, enumerator.Current);
-                    }
+                    more = true;
                 }
             }
+            yield return group;
+        }
 
-            yield return merge(group);
+        yield break;
 
-            // Группа потреблена — записи отдают свои байты пайпам.
-            foreach (var entry in group)
-                entry.Dispose();
-            group.Clear();
-            groupSources.Clear();
+        // MoveNext источника. Синхронное завершение разбирается сразу (в pq или в сброс) —
+        // в полёт уходит только отложенный MoveNext: у async-итераторов синхронно завершённые
+        // MoveNextAsync().AsTask() возвращают один общий кэшированный Task (FromResult),
+        // тождество которого нельзя использовать как ключ.
+        void Advance(IAsyncEnumerator<T> enumerator)
+        {
+            ValueTask<bool> vt = enumerator.MoveNextAsync();
+            if (vt.IsCompletedSuccessfully)
+            {
+                if (vt.Result)
+                    pq.Enqueue(enumerator, enumerator.Current);
+            }
+            else
+            {
+                flight.Add((enumerator, vt.AsTask()));
+            }
         }
     }
 
