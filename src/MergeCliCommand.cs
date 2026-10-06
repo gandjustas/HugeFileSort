@@ -162,8 +162,9 @@ internal partial class MergeCliCommand
         {
             // Большой буфер FileStream: ОС получает последовательные чтения по 4МБ независимо
             // от чередования чтений сотен чанков — мелкие запросы роняют полосу HDD в разы.
+            // Asynchronous: чтение через overlapped IO — продюсер не держит поток пула.
             using FileStream fileStream = new(path, FileMode.Open, FileAccess.Read, FileShare.Read,
-                bufferSize: 4 << 20, FileOptions.SequentialScan);
+                bufferSize: 4 << 20, FileOptions.SequentialScan | FileOptions.Asynchronous);
             // Окно сжатия чанков ограничено бюджетом (~2ГБ на все параллельные декодеры) —
             // лимит задаёт декодер.
             using ZstandardStream zstd = new(fileStream, new ZstandardDecoder(31));
